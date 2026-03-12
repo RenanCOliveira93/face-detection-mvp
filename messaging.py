@@ -1,13 +1,13 @@
 """
 Módulo de Mensageria
 Suporta:
-  1. Evolution API  → WhatsApp (open-source, Docker local)
-  2. Twilio         → SMS (fallback com conta trial)
-  3. Mock           → Simula envio para testes sem API
+  1. Meta Cloud API   → WhatsApp Business oficial (sem Docker)
+  2. Evolution API    → WhatsApp open-source (Docker local, legado)
+  3. Twilio           → SMS (fallback com conta trial)
+  4. Mock             → Simula envio para testes sem API
 """
 
 import requests
-import json
 import re
 from config import CONFIG
 
@@ -24,7 +24,65 @@ def normalize_phone(phone: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. Evolution API (WhatsApp Open Source)
+# 1. Meta Cloud API (WhatsApp Business oficial)
+# ─────────────────────────────────────────────────────────────
+def send_via_meta(phone: str, message: str) -> tuple[bool, str]:
+    """
+    Envia mensagem via WhatsApp Business Cloud API (Meta).
+    Sem Docker, sem servidor local — direto na nuvem da Meta.
+
+    Pré-requisitos:
+      - App criado em https://developers.facebook.com/apps/
+      - Produto WhatsApp adicionado ao App
+      - META_WHATSAPP_TOKEN e META_PHONE_NUMBER_ID configurados no .env
+
+    Docs: https://developers.facebook.com/docs/whatsapp/cloud-api/messages
+    """
+    token           = CONFIG["meta_whatsapp_token"]
+    phone_number_id = CONFIG["meta_phone_number_id"]
+    api_version     = CONFIG["meta_api_version"]
+
+    if not token or not phone_number_id:
+        return False, (
+            "Meta Cloud API não configurada. "
+            "Defina META_WHATSAPP_TOKEN e META_PHONE_NUMBER_ID no .env"
+        )
+
+    number = normalize_phone(phone)
+
+    url = f"https://graph.facebook.com/{api_version}/{phone_number_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": number,
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": message,
+        },
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        data = resp.json()
+        if resp.status_code in (200, 201):
+            msg_id = data.get("messages", [{}])[0].get("id", "?")
+            return True, {"message_id": msg_id, "status": "sent"}
+        else:
+            error = data.get("error", {})
+            return False, f"HTTP {resp.status_code} — {error.get('message', resp.text)}"
+    except requests.exceptions.ConnectionError:
+        return False, "Sem conexão com a API da Meta. Verifique sua internet."
+    except Exception as e:
+        return False, str(e)
+
+
+# ─────────────────────────────────────────────────────────────
+# 2. Evolution API (WhatsApp Open Source — legado/Docker)
 # ─────────────────────────────────────────────────────────────
 def send_via_evolution(phone: str, message: str) -> tuple[bool, str]:
     """
@@ -68,7 +126,7 @@ def send_via_evolution(phone: str, message: str) -> tuple[bool, str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. Twilio SMS (fallback)
+# 3. Twilio SMS (fallback)
 # ─────────────────────────────────────────────────────────────
 def send_via_twilio_sms(phone: str, message: str) -> tuple[bool, str]:
     """
@@ -98,7 +156,7 @@ def send_via_twilio_sms(phone: str, message: str) -> tuple[bool, str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# 3. Mock (para testes sem API)
+# 4. Mock (para testes sem API)
 # ─────────────────────────────────────────────────────────────
 def send_mock(phone: str, message: str) -> tuple[bool, str]:
     """Simula envio de mensagem — apenas loga no terminal."""
@@ -118,11 +176,20 @@ def send_whatsapp_message(phone: str, message: str) -> tuple[bool, str]:
     """
     Envia mensagem usando o canal configurado.
     Ordem de prioridade:
-      MOCK_MESSAGES=true  → mock
-      USE_TWILIO=true     → Twilio SMS
-      padrão              → Evolution API (WhatsApp)
+      MOCK_MESSAGES=true      → mock (sem envio real)
+      USE_META_WHATSAPP=true  → Meta Cloud API (WhatsApp Business)
+      USE_TWILIO=true         → Twilio SMS
+      padrão                  → Evolution API (Docker local, legado)
     """
     if CONFIG["mock_messages"]:
+        return send_mock(phone, message)
+
+    if CONFIG["use_meta_whatsapp"]:
+        ok, info = send_via_meta(phone, message)
+        if ok:
+            return ok, info
+        print(f"[MSG] Meta Cloud API falhou: {info}")
+        print("[MSG] Fallback para mock...")
         return send_mock(phone, message)
 
     if CONFIG["use_twilio"]:
@@ -131,7 +198,7 @@ def send_whatsapp_message(phone: str, message: str) -> tuple[bool, str]:
             return ok, info
         print(f"[MSG] Twilio falhou ({info}), tentando Evolution API...")
 
-    # Tenta Evolution API
+    # Tenta Evolution API (legado)
     ok, info = send_via_evolution(phone, message)
     if not ok:
         print(f"[MSG] Evolution API falhou: {info}")

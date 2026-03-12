@@ -1,10 +1,8 @@
-version: "3.9"
-
 services:
 
   # ── Evolution API (WhatsApp Open Source) ────────────────────
   evolution_api:
-    image: atendai/evolution-api:latest
+    image: atendai/evolution-api:v1.8.2
     container_name: evolution_api_face_mvp
     restart: unless-stopped
     ports:
@@ -17,7 +15,7 @@ services:
       AUTHENTICATION_API_KEY: "B6D711FCDE4D4FD5936544120E713976"
       AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
 
-      # Configurações de armazenamento
+      # Armazenamento em arquivo (sem banco de dados externo)
       DATABASE_ENABLED: "false"
       STORE_MESSAGES: "true"
       STORE_MESSAGE_UP: "true"

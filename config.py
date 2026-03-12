@@ -18,8 +18,16 @@ CONFIG = {
     "model_path": os.getenv("MODEL_PATH", "models/face_encodings.pkl"),
     "training_images_dir": os.getenv("TRAINING_DIR", "training_images"),
 
+    # ── WhatsApp Business (Meta Cloud API) ────
+    # Canal principal — sem Docker, direto na nuvem da Meta
+    # Docs: https://developers.facebook.com/docs/whatsapp/cloud-api
+    "use_meta_whatsapp": os.getenv("USE_META_WHATSAPP", "false").lower() == "true",
+    "meta_whatsapp_token": os.getenv("META_WHATSAPP_TOKEN", "").strip(),
+    "meta_phone_number_id": os.getenv("META_PHONE_NUMBER_ID", "").strip(),
+    "meta_api_version": os.getenv("META_API_VERSION", "v19.0").strip(),
+
     # ── Mensageria WhatsApp (Evolution API) ───
-    # Evolution API rodando localmente via Docker
+    # Evolution API rodando localmente via Docker (legado)
     "evolution_api_url": os.getenv("EVOLUTION_API_URL", "http://localhost:8080"),
     "evolution_api_key": os.getenv("EVOLUTION_API_KEY", "B6D711FCDE4D4FD5936544120E713976"),
     "evolution_instance": os.getenv("EVOLUTION_INSTANCE", "face_mvp"),
