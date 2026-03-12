@@ -1,0 +1,17 @@
+./__pycache__/
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.so
+*.dylib
+*.egg
+*.egg-info
+dist/
+build/
+*.egg-info/
+*/face_detect/bin/
+
+training_images/
+face_detect/
+.env
