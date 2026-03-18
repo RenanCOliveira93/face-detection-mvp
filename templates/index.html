@@ -1,375 +1,121 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Face Recognition MVP</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reconhecimento Facial Escolar</title>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-
     :root {
-      --bg: #0d1117;
-      --surface: #161b22;
-      --surface2: #21262d;
-      --border: #30363d;
-      --green: #3fb950;
-      --red: #f85149;
-      --yellow: #d29922;
-      --blue: #58a6ff;
-      --text: #e6edf3;
-      --muted: #8b949e;
-      --radius: 8px;
+      --bg: #0f172a; --card: #111827; --card-2: #1f2937; --border: #334155;
+      --text: #e5e7eb; --muted: #94a3b8; --green: #22c55e; --red: #ef4444; --yellow: #f59e0b;
     }
-
-    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; min-height: 100vh; }
-
-    /* ── Header ─────────────────────────────── */
-    header {
-      background: var(--surface);
-      border-bottom: 1px solid var(--border);
-      padding: 16px 24px;
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    header .logo { font-size: 1.4rem; }
-    header h1 { font-size: 1.1rem; font-weight: 600; }
-    header .badge {
-      margin-left: auto;
-      font-size: 0.75rem;
-      padding: 3px 10px;
-      border-radius: 20px;
-      background: var(--surface2);
-      border: 1px solid var(--border);
-      color: var(--muted);
-    }
-
-    /* ── Layout ─────────────────────────────── */
-    .container { max-width: 1200px; margin: 0 auto; padding: 24px; display: grid; grid-template-columns: 1fr 340px; gap: 20px; }
-
-    /* ── Card ───────────────────────────────── */
-    .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      overflow: hidden;
-    }
-    .card-header { padding: 14px 20px; border-bottom: 1px solid var(--border); font-size: 0.85rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; display: flex; align-items: center; gap: 8px; }
-    .card-body { padding: 20px; }
-
-    /* ── Webcam ─────────────────────────────── */
-    .webcam-wrap { position: relative; background: #000; border-radius: 0; overflow: hidden; }
-    .webcam-wrap img { width: 100%; display: block; min-height: 300px; object-fit: cover; }
-
-    /* ── Status Overlay ─────────────────────── */
-    #status-overlay {
-      display: none;
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      z-index: 10;
-    }
-    #status-overlay.unknown {
-      display: block;
-      border: 4px solid var(--red);
-      box-shadow: inset 0 0 40px rgba(248,81,73,0.35);
-      animation: pulse-red 1s ease-in-out infinite;
-    }
-    #status-overlay.recognized {
-      display: block;
-      border: 4px solid var(--green);
-      box-shadow: inset 0 0 40px rgba(63,185,80,0.25);
-    }
-    @keyframes pulse-red { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
-
-    /* ── Alert Banner ───────────────────────── */
-    #alert-banner {
-      display: none;
-      background: var(--red);
-      color: #fff;
-      text-align: center;
-      padding: 12px;
-      font-weight: 700;
-      font-size: 1rem;
-      letter-spacing: 1px;
-      animation: blink 0.8s step-start infinite;
-    }
-    #alert-banner.visible { display: block; }
-    @keyframes blink { 50% { background: #c0392b; } }
-
-    /* ── Status Card ────────────────────────── */
-    .status-indicator {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 14px;
-      border-radius: 6px;
-      background: var(--surface2);
-      margin-bottom: 16px;
-    }
-    .dot {
-      width: 10px; height: 10px;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
-    .dot.green  { background: var(--green); box-shadow: 0 0 6px var(--green); }
-    .dot.red    { background: var(--red);   box-shadow: 0 0 6px var(--red); }
-    .dot.yellow { background: var(--yellow); }
-    .dot.gray   { background: var(--muted); }
-
-    .status-text { font-size: 0.9rem; }
-    .status-text strong { display: block; font-size: 1rem; }
-    .status-text small  { color: var(--muted); font-size: 0.78rem; }
-
-    /* ── Person Card ────────────────────────── */
-    #person-info { display: none; margin-top: 12px; }
-    #person-info .field { margin-bottom: 10px; }
-    #person-info .field label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; display: block; margin-bottom: 3px; }
-    #person-info .field span  { font-size: 0.92rem; font-weight: 500; }
-
-    /* ── Message Status ─────────────────────── */
-    #msg-status { display: none; margin-top: 12px; padding: 10px 14px; border-radius: 6px; font-size: 0.85rem; font-weight: 500; }
-    #msg-status.sent    { background: rgba(63,185,80,0.15); border: 1px solid var(--green); color: var(--green); }
-    #msg-status.pending { background: rgba(210,153,34,0.15); border: 1px solid var(--yellow); color: var(--yellow); }
-
-    /* ── Faces Table ────────────────────────── */
-    .faces-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-    .faces-table th { padding: 8px 12px; text-align: left; color: var(--muted); font-size: 0.75rem; text-transform: uppercase; border-bottom: 1px solid var(--border); }
-    .faces-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
-    .faces-table tr:last-child td { border-bottom: none; }
-    .faces-table .chip { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.72rem; background: var(--surface2); border: 1px solid var(--border); color: var(--muted); }
-
-    /* ── Actions ────────────────────────────── */
-    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-    .btn {
-      padding: 8px 16px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: var(--surface2);
-      color: var(--text);
-      font-size: 0.82rem;
-      cursor: pointer;
-      transition: background 0.15s;
-      text-decoration: none;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .btn:hover { background: var(--border); }
-    .btn.primary { background: var(--blue); border-color: var(--blue); color: #000; font-weight: 600; }
-    .btn.primary:hover { opacity: 0.85; }
-
-    /* ── Model warning ──────────────────────── */
-    .warning-box { background: rgba(210,153,34,0.12); border: 1px solid var(--yellow); border-radius: 6px; padding: 12px 16px; font-size: 0.85rem; color: var(--yellow); margin-bottom: 16px; }
-    .warning-box code { background: rgba(255,255,255,0.1); padding: 1px 6px; border-radius: 4px; font-family: monospace; }
-
-    @media (max-width: 800px) {
-      .container { grid-template-columns: 1fr; }
-    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Arial, sans-serif; background: var(--bg); color: var(--text); }
+    header { padding: 20px 24px; border-bottom: 1px solid var(--border); background: var(--card); }
+    .container { max-width: 1200px; margin: 0 auto; padding: 24px; display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+    .card h2 { margin: 0; padding: 16px 20px; font-size: 1rem; border-bottom: 1px solid var(--border); }
+    .card .body { padding: 20px; }
+    .feed { width: 100%; display: block; background: #000; min-height: 360px; }
+    .badge { display: inline-block; border-radius: 999px; padding: 6px 10px; font-size: .8rem; margin-right: 8px; }
+    .green { background: rgba(34,197,94,.15); color: #86efac; }
+    .red { background: rgba(239,68,68,.15); color: #fca5a5; }
+    .yellow { background: rgba(245,158,11,.15); color: #fcd34d; }
+    .muted { color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: left; }
+    th { color: var(--muted); font-size: .8rem; text-transform: uppercase; }
+    code { background: var(--card-2); padding: 2px 6px; border-radius: 6px; }
+    @media (max-width: 900px) { .container { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
+  <header>
+    <h1>Reconhecimento Facial Escolar</h1>
+    <p class="muted">Uma foto por aluno, comparação por similaridade e envio de WhatsApp ao responsável.</p>
+  </header>
 
-<header>
-  <span class="logo">🎥</span>
-  <h1>Face Recognition MVP</h1>
-  <span class="badge">v1.0 · Local</span>
-</header>
+  <div class="container">
+    <section class="card">
+      <h2>Câmera</h2>
+      <img class="feed" src="/video_feed" alt="Vídeo da câmera" />
+    </section>
 
-<div class="container">
-
-  <!-- ── Coluna esquerda: Câmera ── -->
-  <div>
-
-    {% if not model_loaded %}
-    <div class="warning-box">
-      ⚠️ Modelo não carregado — execute <code>python scripts/train_model.py</code> após adicionar fotos e reinicie o servidor.
-    </div>
-    {% endif %}
-
-    <div class="card">
-      <div id="alert-banner">⚠️ ROSTO NÃO RECONHECIDO — ACESSO NEGADO</div>
-      <div class="webcam-wrap">
-        <img id="feed" src="/video_feed" alt="Webcam feed"/>
-        <div id="status-overlay"></div>
+    <aside class="card">
+      <h2>Status em tempo real</h2>
+      <div class="body">
+        <div id="status-badge" class="badge yellow">Aguardando câmera</div>
+        <p id="status-text">Nenhum rosto processado ainda.</p>
+        <hr style="border-color: var(--border); border-width: 1px 0 0; margin: 18px 0;"/>
+        <p><strong>Aluno:</strong> <span id="person-name">—</span></p>
+        <p><strong>Telefone:</strong> <span id="person-phone">—</span></p>
+        <p><strong>Similaridade:</strong> <span id="match-score">—</span></p>
+        <p><strong>Mensagem:</strong> <span id="message-status">—</span></p>
+        <p class="muted" style="margin-top: 16px;">Threshold atual: <code>{{ config.recognition_tolerance }}</code></p>
       </div>
-    </div>
+    </aside>
 
-    <!-- Faces cadastradas -->
-    <div class="card" style="margin-top: 20px;">
-      <div class="card-header">👥 Rostos Cadastrados</div>
-      <div class="card-body" style="padding: 0;">
+    <section class="card" style="grid-column: 1 / -1;">
+      <h2>Alunos cadastrados</h2>
+      <div class="body" style="padding: 0;">
         {% if faces %}
-        <table class="faces-table">
+        <table>
           <thead>
             <tr>
               <th>Nome</th>
               <th>ID</th>
               <th>Telefone</th>
-              <th>Cadastro</th>
+              <th>Foto</th>
             </tr>
           </thead>
           <tbody>
-            {% for f in faces %}
+            {% for face in faces %}
             <tr>
-              <td><strong>{{ f.full_name }}</strong></td>
-              <td><span class="chip">{{ f.id }}</span></td>
-              <td>{{ f.phone }}</td>
-              <td style="color:var(--muted); font-size:0.78rem;">{{ f.created_at[:10] }}</td>
+              <td>{{ face.full_name }}</td>
+              <td><code>{{ face.id }}</code></td>
+              <td>{{ face.phone }}</td>
+              <td>{{ face.photo_path or 'sem foto' }}</td>
             </tr>
             {% endfor %}
           </tbody>
         </table>
         {% else %}
-        <div style="padding:20px; color: var(--muted); text-align:center;">
-          Nenhum rosto cadastrado.<br>
-          <code style="font-size:0.8rem;">python scripts/register_face.py</code>
+        <div style="padding: 20px;">
+          <p>Nenhum aluno cadastrado.</p>
+          <p class="muted">Use <code>python scripts/register_face.py</code> para cadastrar um aluno com foto única.</p>
         </div>
         {% endif %}
       </div>
-    </div>
+    </section>
   </div>
 
-  <!-- ── Coluna direita: Status ── -->
-  <div>
+  <script>
+    async function refreshStatus() {
+      const response = await fetch('/api/status');
+      const data = await response.json();
+      const badge = document.getElementById('status-badge');
+      const text = document.getElementById('status-text');
+      const name = document.getElementById('person-name');
+      const phone = document.getElementById('person-phone');
+      const score = document.getElementById('match-score');
+      const message = document.getElementById('message-status');
 
-    <!-- Status atual -->
-    <div class="card">
-      <div class="card-header">📡 Status em Tempo Real</div>
-      <div class="card-body">
-
-        <div class="status-indicator" id="status-indicator">
-          <div class="dot gray" id="status-dot"></div>
-          <div class="status-text">
-            <strong id="status-label">Aguardando...</strong>
-            <small id="status-sub">Nenhum rosto detectado</small>
-          </div>
-        </div>
-
-        <!-- Info da pessoa reconhecida -->
-        <div id="person-info">
-          <div class="field">
-            <label>Nome</label>
-            <span id="p-name">—</span>
-          </div>
-          <div class="field">
-            <label>Telefone</label>
-            <span id="p-phone">—</span>
-          </div>
-          <div class="field">
-            <label>ID</label>
-            <span id="p-id">—</span>
-          </div>
-        </div>
-
-        <!-- Status da mensagem -->
-        <div id="msg-status"></div>
-
-      </div>
-    </div>
-
-    <!-- Informações do Sistema -->
-    <div class="card" style="margin-top: 16px;">
-      <div class="card-header">⚙️ Sistema</div>
-      <div class="card-body">
-        <div style="font-size:0.82rem; color:var(--muted); line-height:1.9;">
-          <div>Modelo: <span style="color:var(--text)">{{ 'Carregado ✅' if model_loaded else 'Não treinado ❌' }}</span></div>
-          <div>Tolerância: <span style="color:var(--text)">{{ config.recognition_tolerance }}</span></div>
-          <div>Canal mensagem: <span style="color:var(--text)">{{ 'Mock 🧪' if config.mock_messages else ('Twilio SMS' if config.use_twilio else 'Evolution API / WhatsApp') }}</span></div>
-          <div>Remetente: <span style="color:var(--text)">+{{ config.sender_phone }}</span></div>
-        </div>
-
-        <div class="actions">
-          <button class="btn" onclick="reloadModel()">🔄 Recarregar Modelo</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Setup rápido -->
-    <div class="card" style="margin-top: 16px;">
-      <div class="card-header">🚀 Fluxo de Setup</div>
-      <div class="card-body">
-        <div style="font-size: 0.82rem; line-height: 2.2; color: var(--muted);">
-          <div><span style="color:var(--blue)">1.</span> <code>python scripts/register_face.py</code></div>
-          <div><span style="color:var(--blue)">2.</span> Adicionar fotos em <code>training_images/&lt;id&gt;/</code></div>
-          <div><span style="color:var(--blue)">3.</span> <code>python scripts/train_model.py</code></div>
-          <div><span style="color:var(--blue)">4.</span> <code>docker-compose up -d</code> (WhatsApp)</div>
-          <div><span style="color:var(--blue)">5.</span> <code>python scripts/setup_whatsapp.py</code></div>
-          <div><span style="color:var(--blue)">6.</span> Reiniciar e testar! 🎉</div>
-        </div>
-      </div>
-    </div>
-
-  </div>
-</div>
-
-<script>
-  let lastStatus = null;
-
-  function updateStatus() {
-    fetch("/api/status")
-      .then(r => r.json())
-      .then(data => {
-        const dot    = document.getElementById("status-dot");
-        const label  = document.getElementById("status-label");
-        const sub    = document.getElementById("status-sub");
-        const overlay = document.getElementById("status-overlay");
-        const alert   = document.getElementById("alert-banner");
-        const pInfo   = document.getElementById("person-info");
-        const msgEl   = document.getElementById("msg-status");
-
-        // Limpar classes
-        overlay.className = "";
-        alert.classList.remove("visible");
-
-        if (data.status === "recognized" && data.person) {
-          dot.className = "dot green";
-          label.textContent = data.person.full_name;
-          sub.textContent = "✅ Acesso liberado";
-          overlay.className = "recognized";
-
-          document.getElementById("p-name").textContent  = data.person.full_name;
-          document.getElementById("p-phone").textContent = data.person.phone;
-          document.getElementById("p-id").textContent    = data.person.id;
-          pInfo.style.display = "block";
-
-          if (data.message_sent) {
-            msgEl.className = "msg-status sent";
-            msgEl.textContent = "📲 Mensagem WhatsApp enviada";
-            msgEl.style.display = "block";
-          }
-
-        } else if (data.status === "unknown") {
-          dot.className = "dot red";
-          label.textContent = "DESCONHECIDO";
-          sub.textContent = "❌ Acesso negado";
-          overlay.className = "unknown";
-          alert.classList.add("visible");
-          pInfo.style.display = "none";
-          msgEl.style.display = "none";
-
-        } else {
-          dot.className = "dot gray";
-          label.textContent = "Aguardando...";
-          sub.textContent = data.model_loaded
-            ? `Modelo carregado · ${data.trained_faces} rosto(s)`
-            : "⚠️ Modelo não treinado";
-          pInfo.style.display = "none";
-          msgEl.style.display = "none";
-        }
-      })
-      .catch(() => {});
-  }
-
-  function reloadModel() {
-    fetch("/api/reload_model", { method: "POST" })
-      .then(r => r.json())
-      .then(d => alert(d.ok ? `✅ Modelo recarregado (${d.count} encoding(s))` : "❌ Erro ao recarregar"));
-  }
-
-  // Atualizar status a cada segundo
-  setInterval(updateStatus, 1000);
-  updateStatus();
-</script>
+      const styles = {
+        idle: ['yellow', 'Aguardando'],
+        unknown: ['red', 'Rosto desconhecido'],
+        recognized: ['green', 'Aluno reconhecido']
+      };
+      const [klass, label] = styles[data.status] || ['yellow', 'Processando'];
+      badge.className = `badge ${klass}`;
+      badge.textContent = label;
+      text.textContent = `Alunos com embedding salvo: ${data.registered_faces}`;
+      name.textContent = data.person?.full_name || '—';
+      phone.textContent = data.person?.phone || '—';
+      score.textContent = typeof data.match_score === 'number' ? data.match_score.toFixed(3) : '—';
+      message.textContent = data.message_sent ? 'enviada' : (data.message_info || 'pendente');
+    }
+    refreshStatus();
+    setInterval(refreshStatus, 1500);
+  </script>
 </body>
 </html>

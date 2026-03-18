@@ -1,233 +1,85 @@
-# 🎥 Face Recognition MVP
+# Face Detection MVP para escola
 
-Sistema de reconhecimento facial com notificação via **WhatsApp** para controle de acesso.
+Sistema simples de reconhecimento facial de alunos com **uma foto por aluno** e disparo de mensagem no **WhatsApp do responsável**.
 
-> **Stack**: Python · OpenCV · face_recognition · Flask · Evolution API (WhatsApp open-source) · SQLite
+## O que mudou
 
----
+- Não existe mais etapa de treinamento com várias imagens.
+- Cada aluno é cadastrado com uma única foto.
+- No cadastro, a foto é vetorizada e o embedding fica salvo no SQLite.
+- Na câmera, cada rosto detectado é comparado por similaridade com os embeddings cadastrados.
+- O envio de mensagem foi simplificado para **Meta WhatsApp Cloud API** ou **modo mock**.
+- Código legado de treino em lote / Evolution / Twilio deixou de ser o fluxo principal.
 
-## Arquitetura
+## Fluxo
 
-```
-┌─────────────────────────────────────────────────────┐
-│                    FLUXO PRINCIPAL                   │
-│                                                     │
-│  Webcam ──→ OpenCV ──→ face_recognition             │
-│               │              │                      │
-│            Detecta        Compara                   │
-│            rostos         encodings                 │
-│               │              │                      │
-│            ┌──┴──────────────┴──┐                   │
-│            │                   │                    │
-│        CONHECIDO           DESCONHECIDO             │
-│            │                   │                    │
-│      Overlay verde       Overlay vermelho            │
-│      + nome na tela      + banner ALERTA             │
-│            │                                        │
-│    Envia WhatsApp via                               │
-│    Evolution API (Docker)                           │
-│    "[Nome] acabou de chegar aqui. 🟢"               │
-└─────────────────────────────────────────────────────┘
-```
+1. Cadastrar aluno com nome, telefone do responsável e uma foto.
+2. Salvar foto original em `storage/faces/`.
+3. Salvar embedding facial no banco `database/faces.db`.
+4. Ao detectar um rosto na webcam, calcular embedding do frame atual.
+5. Comparar com os embeddings cadastrados.
+6. Se a distância ficar abaixo do threshold (`RECOGNITION_TOLERANCE`), reconhecer o aluno.
+7. Enviar: `Aluno NOME chegou na escola.`
 
-```
-face_recognition_mvp/
-├── main.py                  # Aplicação Flask (servidor + streaming)
-├── config.py                # Configurações centrais
-├── database.py              # SQLite (perfis de rostos + histórico)
-├── messaging.py             # Envio WhatsApp / SMS / Mock
-├── docker-compose.yml       # Evolution API (WhatsApp)
-├── requirements.txt
-├── .env.example             # ← copie para .env
-├── templates/
-│   └── index.html           # Interface web
-├── training_images/         # Fotos de treinamento por pessoa
-│   └── <face_id>/
-│       ├── foto1.jpg
-│       └── ...
-├── models/
-│   └── face_encodings.pkl   # Modelo treinado (gerado automaticamente)
-└── scripts/
-    ├── register_face.py     # Cadastrar novo rosto
-    ├── train_model.py       # Treinar modelo com as fotos
-    ├── demo_setup.py        # Setup rápido para demo
-    ├── setup_whatsapp.py    # Autenticar Evolution API
-    └── test_messaging.py    # Testar envio de mensagem
+## Configuração
+
+Crie um `.env` com algo como:
+
+```env
+PORT=5000
+CAMERA_INDEX=0
+RECOGNITION_TOLERANCE=0.45
+MESSAGE_COOLDOWN=60
+FACE_IMAGES_DIR=storage/faces
+
+# Para testes locais
+MOCK_MESSAGES=true
+
+# Para WhatsApp real pela Meta
+USE_META_WHATSAPP=false
+META_WHATSAPP_TOKEN=
+META_PHONE_NUMBER_ID=
+META_API_VERSION=v19.0
+DEFAULT_RECIPIENT=
 ```
 
----
-
-## ⚡ Setup Rápido (5 minutos)
-
-### 1. Pré-requisitos
+## Instalação
 
 ```bash
-# Python 3.10+
-# Docker + Docker Compose
-# Webcam conectada
-
-# Dependências do sistema (Ubuntu/Debian)
-sudo apt-get install -y cmake build-essential libgtk2.0-dev
-
-# Dependências do sistema (macOS)
-brew install cmake
-```
-
-### 2. Instalar dependências Python
-
-```bash
-# Criar ambiente virtual (recomendado)
-python -m venv venv
-source venv/bin/activate      # Linux/Mac
-# venv\Scripts\activate       # Windows
-
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> ⚠️ A instalação do `face-recognition` (dlib) pode levar alguns minutos.
-
-### 3. Configurar variáveis de ambiente
+## Cadastrar um aluno
 
 ```bash
-cp .env.example .env
-# Edite o .env se necessário (os valores padrão já estão configurados)
+python scripts/register_face.py --name "Maria Souza" --phone "5511999999999" --image "/caminho/maria.jpg"
 ```
 
-### 4. Cadastrar um rosto
+Se preferir, rode sem argumentos e responda interativamente:
 
 ```bash
 python scripts/register_face.py
 ```
 
-Preencha: nome, ID, telefone. Exemplo:
-```
-Nome completo  : João Silva
-ID do rosto    [joao_silva]: (Enter)
-Telefone       : 5514997283283
-```
-
-### 5. Adicionar fotos de treinamento
-
-Copie **5 a 20 fotos** da pessoa para:
-```
-training_images/joao_silva/
-├── foto1.jpg
-├── foto2.jpg
-└── ...
-```
-
-Ou use o script de captura pela webcam:
-```bash
-python scripts/demo_setup.py
-```
-
-### 6. Treinar o modelo
-
-```bash
-python scripts/train_model.py
-```
-
-### 7. Configurar WhatsApp (Evolution API)
-
-```bash
-# Subir o container Docker
-docker-compose up -d
-
-# Aguardar ~10 segundos e autenticar
-python scripts/setup_whatsapp.py
-```
-
-Escaneie o QR Code com o WhatsApp do número **remetente** (5514998338034).
-
-### 8. Iniciar a aplicação
+## Rodar a aplicação
 
 ```bash
 python main.py
 ```
 
-Acesse: **http://localhost:5000**
+Abra `http://localhost:5000`.
 
----
-
-## 🧪 Modo de Teste (sem WhatsApp)
-
-Para testar sem configurar o WhatsApp, ative o modo mock:
+## Testar o WhatsApp
 
 ```bash
-# No .env:
-MOCK_MESSAGES=true
-
-# Ou na linha de comando:
-MOCK_MESSAGES=true python main.py
+python scripts/test_messaging.py
 ```
 
-As mensagens serão exibidas no terminal em vez de enviadas.
+## Observações importantes
 
----
-
-## 📱 Canais de Mensagem
-
-| Canal | Configuração | Observação |
-|-------|-------------|------------|
-| **Evolution API** (padrão) | Docker local | WhatsApp real, gratuito |
-| **Twilio SMS** | `USE_TWILIO=true` + credenciais | Pago, mas simples |
-| **Mock** | `MOCK_MESSAGES=true` | Apenas log no terminal |
-
-### Configurar Twilio (alternativo)
-
-1. Criar conta em [twilio.com](https://www.twilio.com) (trial gratuito)
-2. Obter `Account SID` e `Auth Token`
-3. Configurar no `.env`:
-```env
-USE_TWILIO=true
-TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxx
-TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxx
-TWILIO_FROM=+1xxxxxxxxxx
-```
-
----
-
-## 🎛️ Configurações
-
-| Parâmetro | Padrão | Descrição |
-|-----------|--------|-----------|
-| `RECOGNITION_TOLERANCE` | `0.50` | Sensibilidade (0.4=rigoroso, 0.6=permissivo) |
-| `PORT` | `5000` | Porta do servidor |
-| `SENDER_PHONE` | `5514998338034` | Número remetente |
-| `DEFAULT_RECIPIENT` | `5514997283283` | Destinatário padrão |
-
----
-
-## 🔍 API Endpoints
-
-| Método | Rota | Descrição |
-|--------|------|-----------|
-| `GET` | `/` | Interface web |
-| `GET` | `/video_feed` | Stream MJPEG da câmera |
-| `GET` | `/api/status` | Status JSON em tempo real |
-| `POST` | `/api/reload_model` | Recarregar modelo sem reiniciar |
-
----
-
-## 🛠️ Troubleshooting
-
-**Câmera não abre:**
-```bash
-# Verifique o índice da câmera (0, 1, 2...)
-# Edite main.py: cv2.VideoCapture(0) → cv2.VideoCapture(1)
-```
-
-**Rosto não reconhecido:**
-- Adicione mais fotos (diferentes ângulos e iluminações)
-- Aumente a tolerância: `RECOGNITION_TOLERANCE=0.60`
-- Retreine: `python scripts/train_model.py`
-
-**Evolution API não conecta:**
-```bash
-docker-compose logs evolution_api
-# Verifique se a porta 8080 está livre
-```
-
-**Falsos negativos / positivos:**
-- `0.45` → mais restritivo (menos falsos positivos)
-- `0.55` → mais permissivo (menos falsos negativos)
+- A foto de cadastro deve conter **apenas um rosto**.
+- O threshold ideal depende da câmera e iluminação; comece em `0.45`.
+- Em `MOCK_MESSAGES=true`, nenhuma mensagem real é enviada.
+- Para produção, o canal recomendado aqui é a **Meta WhatsApp Cloud API**.
