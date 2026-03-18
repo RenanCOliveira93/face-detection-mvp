@@ -15,3 +15,5 @@ build/
 training_images/
 face_detect/
 .env
+
+face_detect_env/

@@ -1,4 +1,4 @@
-"""
+source"""
 Configurações centrais do MVP
 Edite este arquivo ou use variáveis de ambiente (.env)
 """
