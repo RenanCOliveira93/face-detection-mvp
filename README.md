@@ -11,15 +11,18 @@ Sistema simples de reconhecimento facial de alunos com **uma foto por aluno** e 
 - O envio de mensagem foi simplificado para **Meta WhatsApp Cloud API** ou **modo mock**.
 - Código legado de treino em lote / Evolution / Twilio deixou de ser o fluxo principal.
 
-## Fluxo
+## Fluxo (entrada/saída + telemetria operacional)
 
 1. Cadastrar aluno com nome, telefone do responsável e uma foto.
 2. Salvar foto original em `storage/faces/`.
 3. Salvar embedding facial no banco `database/faces.db`.
 4. Ao detectar um rosto na webcam, calcular embedding do frame atual.
 5. Comparar com os embeddings cadastrados.
-6. Se a distância ficar abaixo do threshold (`RECOGNITION_TOLERANCE`), reconhecer o aluno.
-7. Enviar: `Aluno NOME chegou na escola.`
+6. Se a distância ficar abaixo do threshold (`RECOGNITION_TOLERANCE`), reconhecer o aluno e abrir uma trilha ativa de presença.
+7. Registrar evento de **entrada** em memória para telemetria (`/api/presence_events`).
+8. Se o aluno ficar sem detecção por alguns segundos, encerrar a trilha ativa e registrar evento de **saída**.
+9. Atualizar o painel (`/api/status`) com `last_event_direction`, `last_event_at` e `active_tracks`.
+10. Enviar: `Aluno NOME chegou na escola.` respeitando cooldown de mensagens.
 
 ## Configuração
 

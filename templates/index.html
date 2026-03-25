@@ -51,9 +51,31 @@
         <p><strong>Telefone:</strong> <span id="person-phone">—</span></p>
         <p><strong>Similaridade:</strong> <span id="match-score">—</span></p>
         <p><strong>Mensagem:</strong> <span id="message-status">—</span></p>
+        <p><strong>Último evento:</strong> <span id="last-event">—</span></p>
+        <p><strong>Ativos no frame:</strong> <span id="active-tracks">0</span></p>
         <p class="muted" style="margin-top: 16px;">Threshold atual: <code>{{ config.recognition_tolerance }}</code></p>
       </div>
     </aside>
+
+    <section class="card" style="grid-column: 1 / -1;">
+      <h2>Histórico resumido de presença</h2>
+      <div class="body" style="padding: 0;">
+        <table>
+          <thead>
+            <tr>
+              <th>Quando (UTC)</th>
+              <th>Direção</th>
+              <th>Aluno</th>
+              <th>ID</th>
+              <th>Similaridade</th>
+            </tr>
+          </thead>
+          <tbody id="presence-events-body">
+            <tr><td colspan="5" class="muted">Sem eventos ainda.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
 
     <section class="card" style="grid-column: 1 / -1;">
       <h2>Alunos cadastrados</h2>
@@ -90,6 +112,17 @@
   </div>
 
   <script>
+    function renderLastEvent(direction, eventAt) {
+      if (!direction || !eventAt) return '—';
+      return `${direction.toUpperCase()} em ${eventAt}`;
+    }
+
+    function directionLabel(direction) {
+      if (direction === 'entrada') return 'ENTRADA';
+      if (direction === 'saida') return 'SAÍDA';
+      return direction || '—';
+    }
+
     async function refreshStatus() {
       const response = await fetch('/api/status');
       const data = await response.json();
@@ -99,6 +132,8 @@
       const phone = document.getElementById('person-phone');
       const score = document.getElementById('match-score');
       const message = document.getElementById('message-status');
+      const lastEvent = document.getElementById('last-event');
+      const activeTracks = document.getElementById('active-tracks');
 
       const styles = {
         idle: ['yellow', 'Aguardando'],
@@ -113,9 +148,36 @@
       phone.textContent = data.person?.phone || '—';
       score.textContent = typeof data.match_score === 'number' ? data.match_score.toFixed(3) : '—';
       message.textContent = data.message_sent ? 'enviada' : (data.message_info || 'pendente');
+      lastEvent.textContent = renderLastEvent(data.last_event_direction, data.last_event_at);
+      activeTracks.textContent = `${data.active_tracks ?? 0}`;
     }
-    refreshStatus();
-    setInterval(refreshStatus, 1500);
+
+    async function refreshPresenceHistory() {
+      const response = await fetch('/api/presence_events');
+      const data = await response.json();
+      const tbody = document.getElementById('presence-events-body');
+      const rows = (data.events || []).map((event) => {
+        const similarity = typeof event.match_score === 'number' ? event.match_score.toFixed(3) : '—';
+        return `
+          <tr>
+            <td>${event.event_at || '—'}</td>
+            <td>${directionLabel(event.direction)}</td>
+            <td>${event.full_name || '—'}</td>
+            <td><code>${event.face_id || '—'}</code></td>
+            <td>${similarity}</td>
+          </tr>`;
+      });
+      tbody.innerHTML = rows.length
+        ? rows.join('')
+        : '<tr><td colspan="5" class="muted">Sem eventos ainda.</td></tr>';
+    }
+
+    async function refreshDashboard() {
+      await Promise.all([refreshStatus(), refreshPresenceHistory()]);
+    }
+
+    refreshDashboard();
+    setInterval(refreshDashboard, 1500);
   </script>
 </body>
 </html>
