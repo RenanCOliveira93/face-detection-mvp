@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timezone
 
 import cv2
 import face_recognition
@@ -18,6 +19,9 @@ app = Flask(__name__)
 db = FaceDatabase()
 registry = FaceRegistry(db)
 
+PRESENCE_EXIT_TIMEOUT_SECONDS = 8
+MAX_PRESENCE_EVENTS = 200
+
 state = {
     "status": "idle",
     "person": None,
@@ -26,9 +30,46 @@ state = {
     "match_score": None,
     "last_detection": None,
     "frame_info": [],
+    "last_event_direction": None,
+    "last_event_at": None,
 }
 state_lock = threading.Lock()
 last_message_time: dict[str, float] = {}
+active_presence_tracks: dict[str, dict] = {}
+presence_events: list[dict] = []
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _record_presence_event(person: dict, direction: str, match_score: float | None) -> None:
+    event = {
+        "face_id": person["id"],
+        "full_name": person["full_name"],
+        "phone": person["phone"],
+        "direction": direction,
+        "event_at": _iso_now(),
+        "match_score": match_score,
+    }
+    with state_lock:
+        presence_events.insert(0, event)
+        del presence_events[MAX_PRESENCE_EVENTS:]
+        state["last_event_direction"] = direction
+        state["last_event_at"] = event["event_at"]
+
+
+def _expire_presence_tracks(now: float) -> None:
+    to_close = []
+    with state_lock:
+        for face_id, track in active_presence_tracks.items():
+            if now - track["last_seen"] > PRESENCE_EXIT_TIMEOUT_SECONDS:
+                to_close.append(track["person"])
+        for person in to_close:
+            active_presence_tracks.pop(person["id"], None)
+
+    for person in to_close:
+        _record_presence_event(person, "saida", None)
 
 
 def generate_frames():
@@ -89,6 +130,8 @@ def generate_frames():
                         }
                     )
 
+            _expire_presence_tracks(time.time())
+
         with state_lock:
             faces_to_draw = list(state["frame_info"])
 
@@ -121,6 +164,18 @@ def _handle_recognized(person: dict, match_score: float | None):
                 "last_detection": now,
             }
         )
+
+        existing_track = active_presence_tracks.get(person["id"])
+        if not existing_track:
+            active_presence_tracks[person["id"]] = {"person": person, "last_seen": now}
+            should_record_entry = True
+        else:
+            existing_track["last_seen"] = now
+            should_record_entry = False
+
+    if should_record_entry:
+        _record_presence_event(person, "entrada", match_score)
+
     if now - last_message_time.get(person["id"], 0) < cooldown:
         return
     last_message_time[person["id"]] = now
@@ -157,6 +212,20 @@ def api_status():
                 "message_info": state["message_info"],
                 "match_score": state["match_score"],
                 "registered_faces": len(registry.known_faces()),
+                "last_event_direction": state["last_event_direction"],
+                "last_event_at": state["last_event_at"],
+                "active_tracks": len(active_presence_tracks),
+            }
+        )
+
+
+@app.route("/api/presence_events")
+def api_presence_events():
+    with state_lock:
+        return jsonify(
+            {
+                "active_tracks": len(active_presence_tracks),
+                "events": presence_events[:20],
             }
         )
 
