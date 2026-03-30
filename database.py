@@ -1,4 +1,4 @@
-"""SQLite para cadastro dos alunos e histórico de detecções."""
+"""SQLite para cadastro dos alunos e histórico de detecções/presença."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 DB_PATH = "database/faces.db"
 
@@ -23,55 +23,86 @@ class FaceDatabase:
         return conn
 
     def _init_db(self) -> None:
+        migrations: list[Callable[[sqlite3.Connection], None]] = [
+            self._migration_1_base_schema,
+            self._migration_2_faces_columns,
+            self._migration_3_detections_columns,
+            self._migration_4_presence_events,
+        ]
         with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS faces (
-                    id TEXT PRIMARY KEY,
-                    full_name TEXT NOT NULL,
-                    phone TEXT NOT NULL,
-                    email TEXT,
-                    notes TEXT,
-                    photo_path TEXT,
-                    encoding_json TEXT,
-                    created_at TEXT NOT NULL,
-                    active INTEGER DEFAULT 1
-                )
-                """
-            )
-            existing_columns = {
-                row[1] for row in conn.execute("PRAGMA table_info(faces)").fetchall()
-            }
-            for column, ddl in {
-                "photo_path": "ALTER TABLE faces ADD COLUMN photo_path TEXT",
-                "encoding_json": "ALTER TABLE faces ADD COLUMN encoding_json TEXT",
-            }.items():
-                if column not in existing_columns:
-                    conn.execute(ddl)
-
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS detections (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    face_id TEXT NOT NULL,
-                    detected_at TEXT NOT NULL,
-                    similarity REAL,
-                    message_ok INTEGER DEFAULT 0,
-                    message_info TEXT,
-                    FOREIGN KEY (face_id) REFERENCES faces(id)
-                )
-                """
-            )
-            detection_columns = {
-                row[1] for row in conn.execute("PRAGMA table_info(detections)").fetchall()
-            }
-            for column, ddl in {
-                "similarity": "ALTER TABLE detections ADD COLUMN similarity REAL",
-                "message_info": "ALTER TABLE detections ADD COLUMN message_info TEXT",
-            }.items():
-                if column not in detection_columns:
-                    conn.execute(ddl)
+            current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            for version, migration in enumerate(migrations, start=1):
+                if current_version < version:
+                    migration(conn)
+                    conn.execute(f"PRAGMA user_version = {version}")
             conn.commit()
+
+    @staticmethod
+    def _migration_1_base_schema(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS faces (
+                id TEXT PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                email TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                active INTEGER DEFAULT 1
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                face_id TEXT NOT NULL,
+                detected_at TEXT NOT NULL,
+                message_ok INTEGER DEFAULT 0,
+                FOREIGN KEY (face_id) REFERENCES faces(id)
+            )
+            """
+        )
+
+    @staticmethod
+    def _migration_2_faces_columns(conn: sqlite3.Connection) -> None:
+        existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(faces)").fetchall()}
+        for column, ddl in {
+            "photo_path": "ALTER TABLE faces ADD COLUMN photo_path TEXT",
+            "encoding_json": "ALTER TABLE faces ADD COLUMN encoding_json TEXT",
+        }.items():
+            if column not in existing_columns:
+                conn.execute(ddl)
+
+    @staticmethod
+    def _migration_3_detections_columns(conn: sqlite3.Connection) -> None:
+        detection_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(detections)").fetchall()
+        }
+        for column, ddl in {
+            "similarity": "ALTER TABLE detections ADD COLUMN similarity REAL",
+            "message_info": "ALTER TABLE detections ADD COLUMN message_info TEXT",
+        }.items():
+            if column not in detection_columns:
+                conn.execute(ddl)
+
+    @staticmethod
+    def _migration_4_presence_events(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS presence_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                face_id TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK(direction IN ('entrada', 'saida')),
+                event_at TEXT NOT NULL,
+                match_score REAL,
+                message_ok INTEGER,
+                message_info TEXT,
+                message_sent_at TEXT,
+                FOREIGN KEY (face_id) REFERENCES faces(id)
+            )
+            """
+        )
 
     def add_face(
         self,
@@ -163,6 +194,59 @@ class FaceDatabase:
                 ),
             )
             conn.commit()
+
+    def create_presence_event(
+        self,
+        face_id: str,
+        direction: str,
+        match_score: float | None,
+    ) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO presence_events (face_id, direction, event_at, match_score)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    face_id,
+                    direction,
+                    datetime.now(timezone.utc).isoformat(),
+                    match_score,
+                ),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def update_presence_event_message(self, event_id: int, message_ok: bool, message_info: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE presence_events
+                SET message_ok = ?, message_info = ?, message_sent_at = ?
+                WHERE id = ?
+                """,
+                (
+                    int(message_ok),
+                    message_info,
+                    datetime.now(timezone.utc).isoformat(),
+                    event_id,
+                ),
+            )
+            conn.commit()
+
+    def get_presence_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT p.*, f.full_name, f.phone
+                FROM presence_events p
+                JOIN faces f ON p.face_id = f.id
+                ORDER BY p.event_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_detections(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._connect() as conn:

@@ -20,43 +20,109 @@ db = FaceDatabase()
 registry = FaceRegistry(db)
 
 PRESENCE_EXIT_TIMEOUT_SECONDS = 8
-MAX_PRESENCE_EVENTS = 200
+MAX_LIVE_EVENTS = 200
 
 state = {
     "status": "idle",
-    "person": None,
-    "message_sent": False,
-    "message_info": None,
-    "match_score": None,
+    "latest_person": None,
+    "latest_match_score": None,
     "last_detection": None,
     "frame_info": [],
     "last_event_direction": None,
     "last_event_at": None,
+    "last_message_sent": False,
+    "last_message_info": None,
+    "recent_people": {},
 }
 state_lock = threading.Lock()
 last_message_time: dict[str, float] = {}
 active_presence_tracks: dict[str, dict] = {}
-presence_events: list[dict] = []
+live_events: list[dict] = []
 
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _record_presence_event(person: dict, direction: str, match_score: float | None) -> None:
-    event = {
+def _message_key(face_id: str, direction: str) -> str:
+    return f"{face_id}:{direction}"
+
+
+def _append_live_event(event: dict) -> None:
+    with state_lock:
+        live_events.insert(0, event)
+        del live_events[MAX_LIVE_EVENTS:]
+        state["last_event_direction"] = event["direction"]
+        state["last_event_at"] = event["event_at"]
+
+
+def _record_presence_event(person: dict, direction: str, match_score: float | None) -> dict:
+    event_id = db.create_presence_event(
+        face_id=person["id"],
+        direction=direction,
+        match_score=match_score,
+    )
+    events = db.get_presence_events(limit=1)
+    event = events[0] if events else {
+        "id": event_id,
         "face_id": person["id"],
         "full_name": person["full_name"],
         "phone": person["phone"],
         "direction": direction,
         "event_at": _iso_now(),
         "match_score": match_score,
+        "message_ok": None,
+        "message_info": None,
+        "message_sent_at": None,
     }
+    _append_live_event(event)
+    return event
+
+
+def _notify_presence_event_async(event: dict, person: dict, match_score: float | None) -> None:
+    direction = event["direction"]
+    if direction == "entrada":
+        message = f"Aluno {person['full_name']} chegou na escola."
+    else:
+        message = f"Aluno {person['full_name']} saiu da escola."
+
+    success, info = send_whatsapp_message(person["phone"], message)
+    db.update_presence_event_message(event["id"], message_ok=success, message_info=str(info))
+    db.log_detection(person["id"], similarity=match_score, message_ok=success, message_info=str(info))
+
     with state_lock:
-        presence_events.insert(0, event)
-        del presence_events[MAX_PRESENCE_EVENTS:]
-        state["last_event_direction"] = direction
-        state["last_event_at"] = event["event_at"]
+        state["last_message_sent"] = success
+        state["last_message_info"] = str(info)
+        state["recent_people"][person["id"]] = {
+            "full_name": person["full_name"],
+            "phone": person["phone"],
+            "last_direction": direction,
+            "message_sent": success,
+            "message_info": str(info),
+            "event_at": event["event_at"],
+        }
+
+
+def _start_event_notification(person: dict, direction: str, match_score: float | None) -> None:
+    now = time.time()
+    cooldown = CONFIG["message_cooldown"]
+    message_key = _message_key(person["id"], direction)
+    if now - last_message_time.get(message_key, 0) < cooldown:
+        event = _record_presence_event(person, direction, match_score)
+        info = f"Cooldown ativo para {direction}."
+        db.update_presence_event_message(event["id"], message_ok=False, message_info=info)
+        with state_lock:
+            state["last_message_sent"] = False
+            state["last_message_info"] = info
+        return
+
+    last_message_time[message_key] = now
+    event = _record_presence_event(person, direction, match_score)
+    threading.Thread(
+        target=_notify_presence_event_async,
+        args=(event, person, match_score),
+        daemon=True,
+    ).start()
 
 
 def _expire_presence_tracks(now: float) -> None:
@@ -69,7 +135,7 @@ def _expire_presence_tracks(now: float) -> None:
             active_presence_tracks.pop(person["id"], None)
 
     for person in to_close:
-        _record_presence_event(person, "saida", None)
+        _start_event_notification(person, "saida", None)
 
 
 def generate_frames():
@@ -111,10 +177,10 @@ def generate_frames():
                         state.update(
                             {
                                 "status": "unknown",
-                                "person": None,
-                                "message_sent": False,
-                                "message_info": None,
-                                "match_score": match_score,
+                                "latest_person": None,
+                                "latest_match_score": match_score,
+                                "last_message_sent": False,
+                                "last_message_info": None,
                             }
                         )
             with state_lock:
@@ -123,10 +189,10 @@ def generate_frames():
                     state.update(
                         {
                             "status": "idle",
-                            "person": None,
-                            "message_sent": False,
-                            "message_info": None,
-                            "match_score": None,
+                            "latest_person": None,
+                            "latest_match_score": None,
+                            "last_message_sent": False,
+                            "last_message_info": None,
                         }
                     )
 
@@ -154,13 +220,12 @@ def generate_frames():
 
 def _handle_recognized(person: dict, match_score: float | None):
     now = time.time()
-    cooldown = CONFIG["message_cooldown"]
     with state_lock:
         state.update(
             {
                 "status": "recognized",
-                "person": person,
-                "match_score": match_score,
+                "latest_person": person,
+                "latest_match_score": match_score,
                 "last_detection": now,
             }
         )
@@ -174,21 +239,7 @@ def _handle_recognized(person: dict, match_score: float | None):
             should_record_entry = False
 
     if should_record_entry:
-        _record_presence_event(person, "entrada", match_score)
-
-    if now - last_message_time.get(person["id"], 0) < cooldown:
-        return
-    last_message_time[person["id"]] = now
-    threading.Thread(target=_send_message_async, args=(person, match_score), daemon=True).start()
-
-
-def _send_message_async(person: dict, match_score: float | None):
-    message = f"Aluno {person['full_name']} chegou na escola."
-    success, info = send_whatsapp_message(person["phone"], message)
-    db.log_detection(person["id"], similarity=match_score, message_ok=success, message_info=str(info))
-    with state_lock:
-        state["message_sent"] = success
-        state["message_info"] = info
+        _start_event_notification(person, "entrada", match_score)
 
 
 @app.route("/")
@@ -207,27 +258,27 @@ def api_status():
         return jsonify(
             {
                 "status": state["status"],
-                "person": state["person"],
-                "message_sent": state["message_sent"],
-                "message_info": state["message_info"],
-                "match_score": state["match_score"],
+                "person": state["latest_person"],
+                "message_sent": state["last_message_sent"],
+                "message_info": state["last_message_info"],
+                "match_score": state["latest_match_score"],
                 "registered_faces": len(registry.known_faces()),
                 "last_event_direction": state["last_event_direction"],
                 "last_event_at": state["last_event_at"],
                 "active_tracks": len(active_presence_tracks),
+                "recent_people": list(state["recent_people"].values())[-10:],
             }
         )
 
 
 @app.route("/api/presence_events")
 def api_presence_events():
-    with state_lock:
-        return jsonify(
-            {
-                "active_tracks": len(active_presence_tracks),
-                "events": presence_events[:20],
-            }
-        )
+    return jsonify(
+        {
+            "active_tracks": len(active_presence_tracks),
+            "events": db.get_presence_events(limit=20),
+        }
+    )
 
 
 @app.route("/api/faces")

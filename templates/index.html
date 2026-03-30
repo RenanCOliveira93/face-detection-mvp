@@ -68,10 +68,11 @@
               <th>Aluno</th>
               <th>ID</th>
               <th>Similaridade</th>
+              <th>Mensagem</th>
             </tr>
           </thead>
           <tbody id="presence-events-body">
-            <tr><td colspan="5" class="muted">Sem eventos ainda.</td></tr>
+            <tr><td colspan="6" class="muted">Sem eventos ainda.</td></tr>
           </tbody>
         </table>
       </div>
@@ -158,6 +159,7 @@
       const tbody = document.getElementById('presence-events-body');
       const rows = (data.events || []).map((event) => {
         const similarity = typeof event.match_score === 'number' ? event.match_score.toFixed(3) : '—';
+        const msg = event.message_ok === 1 ? 'enviada' : (event.message_info || 'pendente');
         return `
           <tr>
             <td>${event.event_at || '—'}</td>
@@ -165,11 +167,12 @@
             <td>${event.full_name || '—'}</td>
             <td><code>${event.face_id || '—'}</code></td>
             <td>${similarity}</td>
+            <td>${msg}</td>
           </tr>`;
       });
       tbody.innerHTML = rows.length
         ? rows.join('')
-        : '<tr><td colspan="5" class="muted">Sem eventos ainda.</td></tr>';
+        : '<tr><td colspan="6" class="muted">Sem eventos ainda.</td></tr>';
     }
 
     async function refreshDashboard() {
