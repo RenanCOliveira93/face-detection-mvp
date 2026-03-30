@@ -19,10 +19,11 @@ Sistema simples de reconhecimento facial de alunos com **uma foto por aluno** e 
 4. Ao detectar um rosto na webcam, calcular embedding do frame atual.
 5. Comparar com os embeddings cadastrados.
 6. Se a distância ficar abaixo do threshold (`RECOGNITION_TOLERANCE`), reconhecer o aluno e abrir uma trilha ativa de presença.
-7. Registrar evento de **entrada** em memória para telemetria (`/api/presence_events`).
-8. Se o aluno ficar sem detecção por alguns segundos, encerrar a trilha ativa e registrar evento de **saída**.
-9. Atualizar o painel (`/api/status`) com `last_event_direction`, `last_event_at` e `active_tracks`.
-10. Enviar: `Aluno NOME chegou na escola.` respeitando cooldown de mensagens.
+7. Registrar evento de **entrada** persistido no SQLite (`presence_events`).
+8. Se o aluno ficar sem detecção por alguns segundos, encerrar a trilha ativa e registrar evento de **saída** persistido.
+9. Atualizar o painel (`/api/status`) com `last_event_direction`, `last_event_at`, `active_tracks` e resumo por aluno.
+10. Enviar mensagens de **entrada e saída** (`chegou` / `saiu`) com cooldown por direção (ex.: `aluno-1:entrada` e `aluno-1:saida`).
+11. Auditar no próprio evento de presença os campos `message_ok`, `message_info` e `message_sent_at`.
 
 ## Configuração
 
@@ -86,3 +87,9 @@ python scripts/test_messaging.py
 - O threshold ideal depende da câmera e iluminação; comece em `0.45`.
 - Em `MOCK_MESSAGES=true`, nenhuma mensagem real é enviada.
 - Para produção, o canal recomendado aqui é a **Meta WhatsApp Cloud API**.
+
+
+## Migrações de banco
+
+O schema agora é versionado com `PRAGMA user_version` e migrações sequenciais automáticas na inicialização (`FaceDatabase`).
+Isso evita divergência de colunas/tabelas em bancos legados e inclui a tabela `presence_events` para auditoria completa de entrada/saída.
