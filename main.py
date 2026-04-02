@@ -67,7 +67,7 @@ def _record_presence_event(person: dict, direction: str, match_score: float | No
         "id": event_id,
         "face_id": person["id"],
         "full_name": person["full_name"],
-        "phone": person["phone"],
+        "phone": person.get("notification_phone") or person.get("phone"),
         "direction": direction,
         "event_at": _iso_now(),
         "match_score": match_score,
@@ -86,7 +86,9 @@ def _notify_presence_event_async(event: dict, person: dict, match_score: float |
     else:
         message = f"Aluno {person['full_name']} saiu da escola."
 
-    success, info = send_whatsapp_message(person["phone"], message)
+    recipient = db.get_preferred_notification_recipient(person["id"], channel="whatsapp")
+    target_phone = (recipient or {}).get("phone") or person.get("phone", "")
+    success, info = send_whatsapp_message(target_phone, message)
     db.update_presence_event_message(event["id"], message_ok=success, message_info=str(info))
     db.log_detection(person["id"], similarity=match_score, message_ok=success, message_info=str(info))
 
@@ -95,7 +97,7 @@ def _notify_presence_event_async(event: dict, person: dict, match_score: float |
         state["last_message_info"] = str(info)
         state["recent_people"][person["id"]] = {
             "full_name": person["full_name"],
-            "phone": person["phone"],
+            "phone": target_phone,
             "last_direction": direction,
             "message_sent": success,
             "message_info": str(info),
