@@ -28,6 +28,7 @@ class FaceDatabase:
             self._migration_2_faces_columns,
             self._migration_3_detections_columns,
             self._migration_4_presence_events,
+            self._migration_5_presence_webhook_audit,
         ]
         with self._connect() as conn:
             current_version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -103,6 +104,21 @@ class FaceDatabase:
             )
             """
         )
+
+
+    @staticmethod
+    def _migration_5_presence_webhook_audit(conn: sqlite3.Connection) -> None:
+        presence_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(presence_events)").fetchall()
+        }
+        for column, ddl in {
+            "webhook_ok": "ALTER TABLE presence_events ADD COLUMN webhook_ok INTEGER",
+            "webhook_status": "ALTER TABLE presence_events ADD COLUMN webhook_status INTEGER",
+            "webhook_info": "ALTER TABLE presence_events ADD COLUMN webhook_info TEXT",
+            "webhook_sent_at": "ALTER TABLE presence_events ADD COLUMN webhook_sent_at TEXT",
+        }.items():
+            if column not in presence_columns:
+                conn.execute(ddl)
 
     def add_face(
         self,
@@ -229,6 +245,31 @@ class FaceDatabase:
                     int(message_ok),
                     message_info,
                     datetime.now(timezone.utc).isoformat(),
+                    event_id,
+                ),
+            )
+            conn.commit()
+
+    def update_presence_event_webhook(
+        self,
+        event_id: int,
+        webhook_ok: bool,
+        webhook_status: int | None,
+        webhook_info: str,
+        webhook_sent_at: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE presence_events
+                SET webhook_ok = ?, webhook_status = ?, webhook_info = ?, webhook_sent_at = ?
+                WHERE id = ?
+                """,
+                (
+                    int(webhook_ok),
+                    webhook_status,
+                    webhook_info,
+                    webhook_sent_at or datetime.now(timezone.utc).isoformat(),
                     event_id,
                 ),
             )

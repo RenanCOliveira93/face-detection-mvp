@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from datetime import datetime, timezone
@@ -13,7 +14,14 @@ from flask import Flask, Response, jsonify, render_template
 from config import CONFIG
 from database import FaceDatabase
 from face_registry import FaceRegistry
+from integrations.webhook_client import publish_presence_event
 from messaging import send_whatsapp_message
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 db = FaceDatabase()
@@ -74,6 +82,10 @@ def _record_presence_event(person: dict, direction: str, match_score: float | No
         "message_ok": None,
         "message_info": None,
         "message_sent_at": None,
+        "webhook_ok": None,
+        "webhook_status": None,
+        "webhook_info": None,
+        "webhook_sent_at": None,
     }
     _append_live_event(event)
     return event
@@ -103,6 +115,33 @@ def _notify_presence_event_async(event: dict, person: dict, match_score: float |
         }
 
 
+def _publish_presence_webhook(event: dict, person: dict) -> None:
+    try:
+        webhook_result = publish_presence_event(event=event, person=person, source="camera")
+        db.update_presence_event_webhook(
+            event_id=event["id"],
+            webhook_ok=bool(webhook_result.get("ok")),
+            webhook_status=webhook_result.get("status"),
+            webhook_info=str(webhook_result.get("info", "")),
+            webhook_sent_at=webhook_result.get("sent_at"),
+        )
+    except Exception as exc:  # proteção para não afetar loop de câmera
+        logger.exception(
+            "presence_webhook_unhandled_error",
+            extra={
+                "event_id": event.get("id"),
+                "face_id": event.get("face_id"),
+                "error": str(exc),
+            },
+        )
+        db.update_presence_event_webhook(
+            event_id=event["id"],
+            webhook_ok=False,
+            webhook_status=None,
+            webhook_info=f"Erro inesperado webhook: {exc}",
+        )
+
+
 def _start_event_notification(person: dict, direction: str, match_score: float | None) -> None:
     now = time.time()
     cooldown = CONFIG["message_cooldown"]
@@ -118,6 +157,7 @@ def _start_event_notification(person: dict, direction: str, match_score: float |
 
     last_message_time[message_key] = now
     event = _record_presence_event(person, direction, match_score)
+    _publish_presence_webhook(event, person)
     threading.Thread(
         target=_notify_presence_event_async,
         args=(event, person, match_score),
