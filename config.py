@@ -26,4 +26,5 @@ CONFIG = {
     "meta_phone_number_id": os.getenv("META_PHONE_NUMBER_ID", "").strip(),
     "meta_api_version": os.getenv("META_API_VERSION", "v19.0").strip(),
     "default_recipient": os.getenv("DEFAULT_RECIPIENT", "").strip(),
+    "attendance_timezone": os.getenv("ATTENDANCE_TIMEZONE", "UTC").strip() or "UTC",
 }

@@ -16,7 +16,7 @@ from face_registry import FaceRegistry
 from messaging import send_whatsapp_message
 
 app = Flask(__name__)
-db = FaceDatabase()
+db = FaceDatabase(attendance_timezone=CONFIG["attendance_timezone"])
 registry = FaceRegistry(db)
 
 PRESENCE_EXIT_TIMEOUT_SECONDS = 8
@@ -277,6 +277,16 @@ def api_presence_events():
         {
             "active_tracks": len(active_presence_tracks),
             "events": db.get_presence_events(limit=20),
+        }
+    )
+
+
+@app.route("/api/daily_attendance")
+def api_daily_attendance():
+    return jsonify(
+        {
+            "timezone": CONFIG["attendance_timezone"],
+            "items": db.get_daily_attendance(limit=200),
         }
     )
 

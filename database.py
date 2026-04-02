@@ -7,14 +7,16 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 DB_PATH = "database/faces.db"
 
 
 class FaceDatabase:
-    def __init__(self, db_path: str = DB_PATH):
+    def __init__(self, db_path: str = DB_PATH, attendance_timezone: str = "UTC"):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.db_path = db_path
+        self.attendance_timezone = attendance_timezone or "UTC"
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -28,6 +30,7 @@ class FaceDatabase:
             self._migration_2_faces_columns,
             self._migration_3_detections_columns,
             self._migration_4_presence_events,
+            self._migration_5_daily_attendance,
         ]
         with self._connect() as conn:
             current_version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -103,6 +106,35 @@ class FaceDatabase:
             )
             """
         )
+
+    @staticmethod
+    def _migration_5_daily_attendance(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                face_id TEXT NOT NULL,
+                attendance_date TEXT NOT NULL,
+                first_entry_at TEXT,
+                last_exit_at TEXT,
+                status TEXT NOT NULL DEFAULT 'inconsistente',
+                total_transitions INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(face_id, attendance_date),
+                FOREIGN KEY (face_id) REFERENCES faces(id)
+            )
+            """
+        )
+
+    def _parse_iso_datetime(self, value: str) -> datetime:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def _attendance_date_from_event(self, event_at: str) -> str:
+        utc_dt = self._parse_iso_datetime(event_at)
+        local_dt = utc_dt.astimezone(ZoneInfo(self.attendance_timezone))
+        return local_dt.date().isoformat()
 
     def add_face(
         self,
@@ -200,7 +232,9 @@ class FaceDatabase:
         face_id: str,
         direction: str,
         match_score: float | None,
+        event_at: str | None = None,
     ) -> int:
+        event_at_value = event_at or datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -210,12 +244,126 @@ class FaceDatabase:
                 (
                     face_id,
                     direction,
-                    datetime.now(timezone.utc).isoformat(),
+                    event_at_value,
                     match_score,
                 ),
             )
+            self._upsert_daily_attendance(
+                conn=conn,
+                face_id=face_id,
+                direction=direction,
+                event_at=event_at_value,
+            )
             conn.commit()
             return int(cursor.lastrowid)
+
+    def _upsert_daily_attendance(
+        self,
+        conn: sqlite3.Connection,
+        face_id: str,
+        direction: str,
+        event_at: str,
+    ) -> None:
+        attendance_date = self._attendance_date_from_event(event_at)
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM daily_attendance
+            WHERE face_id = ? AND attendance_date = ?
+            """,
+            (face_id, attendance_date),
+        ).fetchone()
+
+        if direction == "saida" and row is None:
+            previous_open_row = conn.execute(
+                """
+                SELECT *
+                FROM daily_attendance
+                WHERE face_id = ?
+                  AND attendance_date < ?
+                  AND first_entry_at IS NOT NULL
+                  AND last_exit_at IS NULL
+                ORDER BY attendance_date DESC
+                LIMIT 1
+                """,
+                (face_id, attendance_date),
+            ).fetchone()
+            if previous_open_row is not None:
+                self._update_daily_attendance_row(
+                    conn=conn,
+                    row=previous_open_row,
+                    direction=direction,
+                    event_at=event_at,
+                )
+                return
+
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO daily_attendance (
+                    face_id, attendance_date, first_entry_at, last_exit_at, status, total_transitions
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    face_id,
+                    attendance_date,
+                    event_at if direction == "entrada" else None,
+                    event_at if direction == "saida" else None,
+                    "presente" if direction == "entrada" else "inconsistente",
+                    1,
+                ),
+            )
+            return
+
+        self._update_daily_attendance_row(conn=conn, row=row, direction=direction, event_at=event_at)
+
+    def _update_daily_attendance_row(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        direction: str,
+        event_at: str,
+    ) -> None:
+        face_id = row["face_id"]
+        attendance_date = row["attendance_date"]
+        first_entry_at = row["first_entry_at"]
+        last_exit_at = row["last_exit_at"]
+        total_transitions = int(row["total_transitions"]) + 1
+
+        status = row["status"]
+        if direction == "entrada":
+            if first_entry_at is None:
+                first_entry_at = event_at
+                status = "presente"
+            elif last_exit_at is None:
+                status = "inconsistente"
+            else:
+                if event_at >= last_exit_at:
+                    last_exit_at = None
+                    status = "presente"
+                else:
+                    status = "inconsistente"
+        else:
+            if first_entry_at is None:
+                status = "inconsistente"
+                last_exit_at = event_at
+            elif last_exit_at is None:
+                last_exit_at = event_at
+                status = "ausente"
+            else:
+                status = "inconsistente"
+                if event_at >= last_exit_at:
+                    last_exit_at = event_at
+
+        conn.execute(
+            """
+            UPDATE daily_attendance
+            SET first_entry_at = ?, last_exit_at = ?, status = ?, total_transitions = ?
+            WHERE face_id = ? AND attendance_date = ?
+            """,
+            (first_entry_at, last_exit_at, status, total_transitions, face_id, attendance_date),
+        )
 
     def update_presence_event_message(self, event_id: int, message_ok: bool, message_info: str) -> None:
         with self._connect() as conn:
@@ -255,6 +403,20 @@ class FaceDatabase:
                 SELECT d.*, f.full_name FROM detections d
                 JOIN faces f ON d.face_id = f.id
                 ORDER BY d.detected_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_daily_attendance(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT da.*, f.full_name, f.phone
+                FROM daily_attendance da
+                JOIN faces f ON da.face_id = f.id
+                ORDER BY da.attendance_date DESC, da.face_id ASC
                 LIMIT ?
                 """,
                 (limit,),
