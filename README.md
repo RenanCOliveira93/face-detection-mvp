@@ -8,8 +8,8 @@ Sistema simples de reconhecimento facial de alunos com **uma foto por aluno** e 
 - Cada aluno é cadastrado com uma única foto.
 - No cadastro, a foto é vetorizada e o embedding fica salvo no SQLite.
 - Na câmera, cada rosto detectado é comparado por similaridade com os embeddings cadastrados.
-- O envio de mensagem foi simplificado para **Meta WhatsApp Cloud API** ou **modo mock**.
-- Código legado de treino em lote / Evolution / Twilio deixou de ser o fluxo principal.
+- O envio de mensagem suporta **Meta WhatsApp Cloud API**, **Evolution API** ou **modo mock**.
+- O roteador usa prioridade: `MOCK_MESSAGES` -> `USE_EVOLUTION_API` -> `USE_META_WHATSAPP`.
 
 ## Fluxo (entrada/saída + telemetria operacional)
 
@@ -38,6 +38,12 @@ FACE_IMAGES_DIR=storage/faces
 
 # Para testes locais
 MOCK_MESSAGES=true
+
+# Para WhatsApp real via Evolution API
+USE_EVOLUTION_API=false
+EVOLUTION_BASE_URL=
+EVOLUTION_API_KEY=
+EVOLUTION_INSTANCE=
 
 # Para WhatsApp real pela Meta
 USE_META_WHATSAPP=false
@@ -93,3 +99,30 @@ python scripts/test_messaging.py
 
 O schema agora é versionado com `PRAGMA user_version` e migrações sequenciais automáticas na inicialização (`FaceDatabase`).
 Isso evita divergência de colunas/tabelas em bancos legados e inclui a tabela `presence_events` para auditoria completa de entrada/saída.
+
+## Validar Evolution em homologação
+
+1. Configure no `.env`:
+
+```env
+MOCK_MESSAGES=false
+USE_EVOLUTION_API=true
+EVOLUTION_BASE_URL=http://localhost:8080
+EVOLUTION_API_KEY=seu-token
+EVOLUTION_INSTANCE=instancia-hml
+```
+
+2. Execute um disparo de teste sem enviar (validação de argumentos):
+
+```bash
+python scripts/send_evolution_message.py --phone 5511999999999 --message "Teste homologação" --dry-run
+```
+
+3. Execute o disparo real:
+
+```bash
+python scripts/send_evolution_message.py --phone 5511999999999 --message "Teste homologação"
+```
+
+4. Verifique no retorno os campos padronizados para auditoria: `success`, `provider`, `request_id`, `raw_response`.
+
