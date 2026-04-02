@@ -45,6 +45,22 @@ class PresencePipelineIntegrationTests(unittest.TestCase):
         self.assertIn("entrada", directions)
         self.assertIn("saida", directions)
 
+
+    def test_presence_event_tracks_webhook_audit(self) -> None:
+        event_id = self.db.create_presence_event("stu-1", "entrada", 0.22)
+        self.db.update_presence_event_webhook(
+            event_id=event_id,
+            webhook_ok=True,
+            webhook_status=202,
+            webhook_info="accepted",
+        )
+
+        events = self.db.get_presence_events(limit=5)
+        self.assertEqual(events[0]["webhook_ok"], 1)
+        self.assertEqual(events[0]["webhook_status"], 202)
+        self.assertEqual(events[0]["webhook_info"], "accepted")
+        self.assertIsNotNone(events[0]["webhook_sent_at"])
+
     def test_migrations_set_user_version(self) -> None:
         with self.db._connect() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -89,6 +105,22 @@ class PresencePipelineIntegrationTests(unittest.TestCase):
         recipient = self.db.get_preferred_notification_recipient("stu-1", channel="whatsapp")
         self.assertIsNotNone(recipient)
         self.assertEqual(recipient["phone"], "5511999999999")
+    def test_try_reserve_message_dispatch_blocks_second_send_same_day(self) -> None:
+        first_ok, first_reason = self.db.try_reserve_message_dispatch(
+            face_id="stu-1",
+            direction="entrada",
+            cooldown_seconds=60,
+        )
+        second_ok, second_reason = self.db.try_reserve_message_dispatch(
+            face_id="stu-1",
+            direction="entrada",
+            cooldown_seconds=60,
+        )
+
+        self.assertTrue(first_ok)
+        self.assertEqual(first_reason, "reserved")
+        self.assertFalse(second_ok)
+        self.assertEqual(second_reason, "cooldown")
 
 
 if __name__ == "__main__":
