@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime, timezone
 
 from database import FaceDatabase
 
@@ -65,6 +66,45 @@ class PresencePipelineIntegrationTests(unittest.TestCase):
             version = conn.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(version, 5)
 
+    def test_resolves_recipient_by_relationship_priority(self) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self.db._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO guardians (full_name, created_at, active) VALUES (?, ?, 1)",
+                ("Mãe do Aluno", now_iso),
+            )
+            mother_id = int(cursor.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO guardian_phones (guardian_id, phone_e164, is_primary, channel, active, created_at)
+                VALUES (?, ?, 1, 'whatsapp', 1, ?)
+                """,
+                (mother_id, "5511888888888", now_iso),
+            )
+            conn.execute(
+                """
+                INSERT INTO student_guardians (
+                    face_id, guardian_id, relationship_type, contact_priority,
+                    valid_from, valid_to, active, created_at
+                ) VALUES (?, ?, 'mãe', 0, ?, NULL, 1, ?)
+                """,
+                ("stu-1", mother_id, now_iso, now_iso),
+            )
+            conn.commit()
+
+        recipient = self.db.get_preferred_notification_recipient("stu-1", channel="whatsapp")
+        self.assertIsNotNone(recipient)
+        self.assertEqual(recipient["phone"], "5511888888888")
+        self.assertEqual(recipient["relationship_type"], "mãe")
+
+    def test_fallback_to_faces_phone_when_no_guardian(self) -> None:
+        with self.db._connect() as conn:
+            conn.execute("DELETE FROM student_guardians WHERE face_id = ?", ("stu-1",))
+            conn.commit()
+
+        recipient = self.db.get_preferred_notification_recipient("stu-1", channel="whatsapp")
+        self.assertIsNotNone(recipient)
+        self.assertEqual(recipient["phone"], "5511999999999")
     def test_try_reserve_message_dispatch_blocks_second_send_same_day(self) -> None:
         first_ok, first_reason = self.db.try_reserve_message_dispatch(
             face_id="stu-1",
