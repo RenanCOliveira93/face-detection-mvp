@@ -35,17 +35,12 @@ state = {
     "recent_people": {},
 }
 state_lock = threading.Lock()
-last_message_time: dict[str, float] = {}
 active_presence_tracks: dict[str, dict] = {}
 live_events: list[dict] = []
 
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _message_key(face_id: str, direction: str) -> str:
-    return f"{face_id}:{direction}"
 
 
 def _append_live_event(event: dict) -> None:
@@ -104,19 +99,25 @@ def _notify_presence_event_async(event: dict, person: dict, match_score: float |
 
 
 def _start_event_notification(person: dict, direction: str, match_score: float | None) -> None:
-    now = time.time()
-    cooldown = CONFIG["message_cooldown"]
-    message_key = _message_key(person["id"], direction)
-    if now - last_message_time.get(message_key, 0) < cooldown:
+    cooldown_by_direction = {
+        "entrada": CONFIG["entry_cooldown_seconds"],
+        "saida": CONFIG["exit_cooldown_seconds"],
+    }
+    allowed, lock_reason = db.try_reserve_message_dispatch(
+        face_id=person["id"],
+        direction=direction,
+        cooldown_seconds=cooldown_by_direction.get(direction, CONFIG["entry_cooldown_seconds"]),
+    )
+
+    if not allowed:
         event = _record_presence_event(person, direction, match_score)
-        info = f"Cooldown ativo para {direction}."
+        info = lock_reason
         db.update_presence_event_message(event["id"], message_ok=False, message_info=info)
         with state_lock:
             state["last_message_sent"] = False
             state["last_message_info"] = info
         return
 
-    last_message_time[message_key] = now
     event = _record_presence_event(person, direction, match_score)
     threading.Thread(
         target=_notify_presence_event_async,

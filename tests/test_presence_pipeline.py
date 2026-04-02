@@ -47,7 +47,24 @@ class PresencePipelineIntegrationTests(unittest.TestCase):
     def test_migrations_set_user_version(self) -> None:
         with self.db._connect() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
+
+    def test_try_reserve_message_dispatch_blocks_second_send_same_day(self) -> None:
+        first_ok, first_reason = self.db.try_reserve_message_dispatch(
+            face_id="stu-1",
+            direction="entrada",
+            cooldown_seconds=60,
+        )
+        second_ok, second_reason = self.db.try_reserve_message_dispatch(
+            face_id="stu-1",
+            direction="entrada",
+            cooldown_seconds=60,
+        )
+
+        self.assertTrue(first_ok)
+        self.assertEqual(first_reason, "reserved")
+        self.assertFalse(second_ok)
+        self.assertEqual(second_reason, "cooldown")
 
 
 if __name__ == "__main__":

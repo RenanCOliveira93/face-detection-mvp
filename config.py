@@ -19,7 +19,12 @@ CONFIG = {
     "face_images_dir": os.getenv("FACE_IMAGES_DIR", "storage/faces"),
     "frame_process_scale": float(os.getenv("FRAME_PROCESS_SCALE", 0.5)),
     "frame_process_every": int(os.getenv("FRAME_PROCESS_EVERY", 3)),
-    "message_cooldown": int(os.getenv("MESSAGE_COOLDOWN", 60)),
+    "entry_cooldown_seconds": int(
+        os.getenv("ENTRY_COOLDOWN_SECONDS", os.getenv("MESSAGE_COOLDOWN", 60))
+    ),
+    "exit_cooldown_seconds": int(
+        os.getenv("EXIT_COOLDOWN_SECONDS", os.getenv("MESSAGE_COOLDOWN", 60))
+    ),
     "mock_messages": _env_bool("MOCK_MESSAGES", "true"),
     "use_meta_whatsapp": _env_bool("USE_META_WHATSAPP"),
     "meta_whatsapp_token": os.getenv("META_WHATSAPP_TOKEN", "").strip(),
