@@ -44,10 +44,26 @@ class PresencePipelineIntegrationTests(unittest.TestCase):
         self.assertIn("entrada", directions)
         self.assertIn("saida", directions)
 
+
+    def test_presence_event_tracks_webhook_audit(self) -> None:
+        event_id = self.db.create_presence_event("stu-1", "entrada", 0.22)
+        self.db.update_presence_event_webhook(
+            event_id=event_id,
+            webhook_ok=True,
+            webhook_status=202,
+            webhook_info="accepted",
+        )
+
+        events = self.db.get_presence_events(limit=5)
+        self.assertEqual(events[0]["webhook_ok"], 1)
+        self.assertEqual(events[0]["webhook_status"], 202)
+        self.assertEqual(events[0]["webhook_info"], "accepted")
+        self.assertIsNotNone(events[0]["webhook_sent_at"])
+
     def test_migrations_set_user_version(self) -> None:
         with self.db._connect() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 4)
+        self.assertEqual(version, 5)
 
 
 if __name__ == "__main__":
