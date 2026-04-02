@@ -28,6 +28,7 @@ class FaceDatabase:
             self._migration_2_faces_columns,
             self._migration_3_detections_columns,
             self._migration_4_presence_events,
+            self._migration_5_message_dispatch_locks,
             self._migration_5_presence_webhook_audit,
         ]
         with self._connect() as conn:
@@ -105,6 +106,21 @@ class FaceDatabase:
             """
         )
 
+    @staticmethod
+    def _migration_5_message_dispatch_locks(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_dispatch_locks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                face_id TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK(direction IN ('entrada', 'saida')),
+                business_date TEXT NOT NULL,
+                last_sent_at TEXT NOT NULL,
+                FOREIGN KEY (face_id) REFERENCES faces(id),
+                UNIQUE(face_id, direction, business_date)
+            )
+            """
+        )
 
     @staticmethod
     def _migration_5_presence_webhook_audit(conn: sqlite3.Connection) -> None:
@@ -301,6 +317,50 @@ class FaceDatabase:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def try_reserve_message_dispatch(
+        self,
+        face_id: str,
+        direction: str,
+        cooldown_seconds: int,
+    ) -> tuple[bool, str]:
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        business_date = now.date().isoformat()
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                """
+                SELECT last_sent_at
+                FROM message_dispatch_locks
+                WHERE face_id = ? AND direction = ? AND business_date = ?
+                """,
+                (face_id, direction, business_date),
+            ).fetchone()
+
+            if existing:
+                last_sent_at = datetime.fromisoformat(existing["last_sent_at"])
+                elapsed = (now - last_sent_at).total_seconds()
+                if elapsed < cooldown_seconds:
+                    conn.commit()
+                    return False, "cooldown"
+                conn.commit()
+                return False, "already_sent"
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO message_dispatch_locks (face_id, direction, business_date, last_sent_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (face_id, direction, business_date, now_iso),
+                )
+                conn.commit()
+                return True, "reserved"
+            except sqlite3.IntegrityError:
+                conn.commit()
+                return False, "duplicate"
 
     @staticmethod
     def _row_to_face(row: sqlite3.Row | None) -> dict[str, Any] | None:
