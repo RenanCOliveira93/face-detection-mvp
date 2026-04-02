@@ -32,6 +32,7 @@ CONFIG = {
     "meta_phone_number_id": os.getenv("META_PHONE_NUMBER_ID", "").strip(),
     "meta_api_version": os.getenv("META_API_VERSION", "v19.0").strip(),
     "default_recipient": os.getenv("DEFAULT_RECIPIENT", "").strip(),
+    "attendance_timezone": os.getenv("ATTENDANCE_TIMEZONE", "UTC").strip() or "UTC",
     "webhook_url": os.getenv("WEBHOOK_URL", "").strip(),
     "webhook_secret": os.getenv("WEBHOOK_SECRET", "").strip(),
     "webhook_timeout_seconds": float(os.getenv("WEBHOOK_TIMEOUT_SECONDS", 1.5)),
