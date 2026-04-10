@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
 import os
 import urllib.error
 import urllib.request
 from typing import Any
+
+if importlib.util.find_spec("dotenv") is not None:
+    import dotenv
+    dotenv.load_dotenv()
 
 
 def normalize_phone(phone: str) -> str:
@@ -29,7 +34,7 @@ def _build_response(success: bool, request_id: str, raw_response: Any) -> tuple[
 
 
 def send_via_evolution(phone: str, message: str) -> tuple[bool, dict[str, Any]]:
-    base_url = os.getenv("EVOLUTION_BASE_URL", "").strip().rstrip("/")
+    base_url = os.getenv("EVOLUTION_API_URL", "").strip().rstrip("/")
     api_key = os.getenv("EVOLUTION_API_KEY", "").strip()
     instance = os.getenv("EVOLUTION_INSTANCE", "").strip()
 
@@ -37,12 +42,12 @@ def send_via_evolution(phone: str, message: str) -> tuple[bool, dict[str, Any]]:
         return _build_response(
             False,
             "",
-            "Evolution API não configurada. Defina EVOLUTION_BASE_URL, EVOLUTION_API_KEY e EVOLUTION_INSTANCE.",
+            "Evolution API não configurada. Defina EVOLUTION_API_URL, EVOLUTION_API_KEY e EVOLUTION_INSTANCE.",
         )
 
     number = normalize_phone(phone)
     url = f"{base_url}/message/sendText/{instance}"
-    payload = json.dumps({"number": number, "textMessage": {"text": message}}).encode("utf-8")
+    payload = json.dumps({"number": number, "text": message}).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=payload,
