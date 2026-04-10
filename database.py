@@ -138,6 +138,7 @@ class FaceDatabase:
         utc_dt = self._parse_iso_datetime(event_at)
         local_dt = utc_dt.astimezone(ZoneInfo(self.attendance_timezone))
         return local_dt.date().isoformat()
+    @staticmethod
     def _migration_5_guardians_contacts(conn: sqlite3.Connection) -> None:
         conn.execute(
             """
@@ -235,6 +236,7 @@ class FaceDatabase:
                 """,
                 (face["id"], guardian_id, now_iso, now_iso),
             )
+    @staticmethod
     def _migration_5_message_dispatch_locks(conn: sqlite3.Connection) -> None:
         conn.execute(
             """

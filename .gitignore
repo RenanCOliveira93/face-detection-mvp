@@ -17,3 +17,11 @@ face_detect/
 .env
 
 face_detect_env/
+face_env/
+venv/
+env/
+
+database/
+storage/
+scripts/database/
+scripts/storage/

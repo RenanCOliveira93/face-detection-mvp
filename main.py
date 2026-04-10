@@ -7,13 +7,16 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import os
+import tempfile
+
 import cv2
 import face_recognition
-from flask import Flask, Response, jsonify, render_template
+from flask import Flask, Response, jsonify, render_template, request
 
 from config import CONFIG
 from database import FaceDatabase
-from face_registry import FaceRegistry
+from face_registry import FaceRegistry, slugify
 from integrations.webhook_client import publish_presence_event
 from messaging import send_whatsapp_message
 
@@ -26,6 +29,16 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 db = FaceDatabase(attendance_timezone=CONFIG["attendance_timezone"])
 registry = FaceRegistry(db)
+
+_CORS_ORIGIN = os.getenv("CORS_ORIGIN", "*")
+
+
+@app.after_request
+def _add_cors(response):
+    response.headers["Access-Control-Allow-Origin"] = _CORS_ORIGIN
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+    return response
 
 PRESENCE_EXIT_TIMEOUT_SECONDS = 8
 MAX_LIVE_EVENTS = 200
@@ -336,7 +349,77 @@ def api_daily_attendance():
 
 @app.route("/api/faces")
 def api_faces():
-    return jsonify(db.list_faces())
+    faces = db.list_faces()
+    result = []
+    for f in faces:
+        result.append({
+            "id": f["id"],
+            "face_id": f["id"],
+            "full_name": f["full_name"],
+            "phone": f.get("phone"),
+            "email": f.get("email"),
+            "notes": f.get("notes"),
+            "photo_path": f.get("photo_path"),
+            "has_encoding": f.get("has_encoding", False),
+            "created_at": f.get("created_at"),
+            "notification_phone": f.get("notification_phone"),
+        })
+    return jsonify(result)
+
+
+@app.route("/api/register", methods=["POST", "OPTIONS"])
+def api_register():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    name = request.form.get("name", "").strip()
+    phone = request.form.get("phone", "").strip()
+    email = request.form.get("email", "").strip()
+    notes = request.form.get("notes", "").strip()
+    custom_id = request.form.get("id", "").strip() or None
+    image_file = request.files.get("image")
+
+    if not name or not phone:
+        return jsonify({"success": False, "error": "Nome e telefone são obrigatórios"}), 400
+
+    tmp_path = None
+    try:
+        if image_file and image_file.filename:
+            ext = os.path.splitext(image_file.filename)[1].lower() or ".jpg"
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext)
+            os.close(tmp_fd)
+            image_file.save(tmp_path)
+            student = registry.register_face(
+                full_name=name,
+                phone=phone,
+                image_path=tmp_path,
+                face_id=custom_id,
+                email=email,
+                notes=notes,
+            )
+        else:
+            # Cadastro sem foto — aluno não será reconhecido até foto ser adicionada
+            person_id = custom_id or slugify(name)
+            existing = db.get_face(person_id)
+            payload = dict(full_name=name, phone=phone, email=email, notes=notes)
+            if existing:
+                db.update_face(person_id, **payload)
+            else:
+                db.add_face(face_id=person_id, **payload)
+            student = db.get_face(person_id)
+
+        # Recarrega known_faces para reconhecimento imediato
+        registry.known_faces()
+
+        return jsonify({"success": True, "student": student})
+    except (FileNotFoundError, ValueError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except Exception as exc:
+        logger.exception("api_register_error", extra={"name": name, "error": str(exc)})
+        return jsonify({"success": False, "error": "Erro interno ao cadastrar aluno"}), 500
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 if __name__ == "__main__":
