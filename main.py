@@ -10,13 +10,11 @@ from datetime import datetime, timezone
 import os
 import tempfile
 
-import cv2
-import face_recognition
 from flask import Flask, Response, jsonify, render_template, request
 
 from config import CONFIG
 from database import FaceDatabase
-from face_registry import FaceRegistry, slugify
+from face_registry import slugify
 from integrations.webhook_client import publish_presence_event
 from messaging import send_whatsapp_message
 
@@ -28,7 +26,81 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 db = FaceDatabase(attendance_timezone=CONFIG["attendance_timezone"])
-registry = FaceRegistry(db)
+
+# In Control iD mode the device does recognition and POSTs to our callback, so
+# we skip loading the local webcam stack and the InsightFace model entirely
+# (saves CPU/RAM on the edge host).
+USE_CONTROL_ID = bool(CONFIG.get("use_control_id"))
+
+if USE_CONTROL_ID:
+    inference_backend = None
+    registry = None
+    _MODEL_VERSION = CONFIG.get("model_version") or "control_id"
+    _ACTIVE_PROVIDER = "control_id"
+    logger.info("Control iD mode enabled — webcam + InsightFace model NOT loaded.")
+else:
+    from face_registry import FaceRegistry
+    from inference import build_backend
+    from inference.providers import describe_active_provider
+
+    inference_backend = build_backend()
+    registry = FaceRegistry(db, backend=inference_backend)
+    if hasattr(inference_backend, "warmup"):
+        inference_backend.warmup()
+    _MODEL_VERSION = inference_backend.model_version
+    _ACTIVE_PROVIDER = describe_active_provider(inference_backend.providers)
+
+from sync import (  # noqa: E402
+    HeartbeatWorker,
+    KitchenDispatchWorker,
+    OutboxWorker,
+    reconcile_students,
+)
+from repositories import (  # noqa: E402
+    ClassRepository,
+    DietaryRestrictionRepository,
+    KitchenRepository,
+    StudentRepository,
+)
+
+_SCHOOL_ID = CONFIG.get("school_id") or ""
+_DEVICE_ID = CONFIG.get("device_id") or ""
+
+# Boot-time reconciliation (no-op if cloud disabled). In Control iD mode we pull
+# students without embeddings (the device handles recognition).
+if CONFIG.get("reconcile_on_boot"):
+    try:
+        reconcile_students(
+            db, _SCHOOL_ID, _MODEL_VERSION, require_embedding=not USE_CONTROL_ID
+        )
+        if registry is not None:
+            registry.invalidate_cache()
+    except Exception:  # noqa: BLE001
+        logger.exception("reconcile_students failed at boot; continuing with local cache.")
+
+outbox_worker = OutboxWorker(db, school_id=_SCHOOL_ID, device_id=_DEVICE_ID or None)
+outbox_worker.start()
+
+heartbeat_worker = HeartbeatWorker(
+    device_id=_DEVICE_ID,
+    school_id=_SCHOOL_ID,
+    model_version=_MODEL_VERSION,
+    inference_provider=_ACTIVE_PROVIDER,
+)
+heartbeat_worker.start()
+
+kitchen_worker = KitchenDispatchWorker(
+    db=db,
+    school_id=_SCHOOL_ID,
+    send_message_fn=send_whatsapp_message,
+)
+kitchen_worker.start()
+
+# Repos used by the new endpoints
+classes_repo = ClassRepository(school_id=_SCHOOL_ID)
+dietary_repo = DietaryRestrictionRepository(school_id=_SCHOOL_ID)
+kitchen_repo = KitchenRepository(school_id=_SCHOOL_ID)
+students_repo = StudentRepository(school_id=_SCHOOL_ID, model_version=_MODEL_VERSION)
 
 _CORS_ORIGIN = os.getenv("CORS_ORIGIN", "*")
 
@@ -96,7 +168,29 @@ def _record_presence_event(person: dict, direction: str, match_score: float | No
         "webhook_sent_at": None,
     }
     _append_live_event(event)
+    _enqueue_event_to_outbox(person, event, match_score)
     return event
+
+
+def _enqueue_event_to_outbox(person: dict, event: dict, match_score: float | None) -> None:
+    """Best-effort enqueue. If we don't have the Supabase student id yet, skip
+    cloud sync silently — the camera loop never depends on the cloud."""
+    supabase_id = person.get("supabase_id") or db.get_face_supabase_id(person["id"])
+    if not supabase_id:
+        return
+    try:
+        db.enqueue_outbox(
+            "presence_event",
+            {
+                "student_id": supabase_id,
+                "face_id": person["id"],
+                "direction": event["direction"],
+                "event_at": event["event_at"],
+                "match_score": match_score,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to enqueue presence_event to outbox.")
 
 
 def _notify_presence_event_async(event: dict, person: dict, match_score: float | None) -> None:
@@ -195,11 +289,12 @@ def _expire_presence_tracks(now: float) -> None:
 
 
 def generate_frames():
+    import cv2  # local import: not needed in Control iD mode
+
     cap = cv2.VideoCapture(CONFIG["camera_index"])
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     frame_count = 0
-    scale = CONFIG["frame_process_scale"]
     process_every = max(1, int(CONFIG["frame_process_every"]))
 
     while True:
@@ -210,17 +305,17 @@ def generate_frames():
         current_faces = []
 
         if frame_count % process_every == 0:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            small = cv2.resize(rgb_frame, (0, 0), fx=scale, fy=scale)
-            locations = face_recognition.face_locations(small, model="hog")
-            encodings = face_recognition.face_encodings(small, locations)
+            detections = inference_backend.extract(frame)
 
-            for encoding, location in zip(encodings, locations):
-                person, match_score = registry.match_encoding(encoding)
-                top, right, bottom, left = [int(v / scale) for v in location]
+            for det in detections:
+                person, match_score = registry.match_embedding(det.embedding)
+                x1, y1, x2, y2 = det.bbox
+                # Keep the legacy (top, right, bottom, left) tuple so the drawing
+                # code below and downstream consumers don't need to change.
                 current_faces.append(
                     {
-                        "location": (top, right, bottom, left),
+                        "location": (y1, x2, y2, x1),
+                        "det_score": det.det_score,
                         "known": bool(person),
                         "person": person,
                         "match_score": match_score,
@@ -305,6 +400,8 @@ def index():
 
 @app.route("/video_feed")
 def video_feed():
+    if USE_CONTROL_ID:
+        return jsonify({"error": "video_feed indisponível em modo Control iD"}), 409
     return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -377,6 +474,24 @@ def api_register():
     email = request.form.get("email", "").strip()
     notes = request.form.get("notes", "").strip()
     custom_id = request.form.get("id", "").strip() or None
+    enrollment_number = request.form.get("enrollment_number", "").strip() or None
+    class_id = request.form.get("class_id", "").strip() or None
+    # restriction_ids may come as comma-separated, JSON array, or repeated field
+    raw_restrictions = request.form.getlist("restriction_id") or []
+    if not raw_restrictions:
+        single = request.form.get("restriction_ids", "").strip()
+        if single:
+            try:
+                import json as _json
+                parsed = _json.loads(single)
+                if isinstance(parsed, list):
+                    raw_restrictions = [str(x) for x in parsed]
+                else:
+                    raw_restrictions = [str(parsed)]
+            except ValueError:
+                raw_restrictions = [r.strip() for r in single.split(",") if r.strip()]
+    restriction_ids = [r for r in raw_restrictions if r]
+
     image_file = request.files.get("image")
 
     if not name or not phone:
@@ -384,7 +499,7 @@ def api_register():
 
     tmp_path = None
     try:
-        if image_file and image_file.filename:
+        if image_file and image_file.filename and registry is not None:
             ext = os.path.splitext(image_file.filename)[1].lower() or ".jpg"
             tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext)
             os.close(tmp_fd)
@@ -396,20 +511,27 @@ def api_register():
                 face_id=custom_id,
                 email=email,
                 notes=notes,
+                enrollment_number=enrollment_number,
+                class_id=class_id,
+                restriction_ids=restriction_ids,
             )
         else:
             # Cadastro sem foto — aluno não será reconhecido até foto ser adicionada
             person_id = custom_id or slugify(name)
             existing = db.get_face(person_id)
-            payload = dict(full_name=name, phone=phone, email=email, notes=notes)
+            payload = dict(
+                full_name=name, phone=phone, email=email, notes=notes,
+                enrollment_number=enrollment_number, class_id=class_id,
+            )
             if existing:
                 db.update_face(person_id, **payload)
             else:
                 db.add_face(face_id=person_id, **payload)
             student = db.get_face(person_id)
 
-        # Recarrega known_faces para reconhecimento imediato
-        registry.known_faces()
+        # Recarrega known_faces para reconhecimento imediato (modo câmera local)
+        if registry is not None:
+            registry.known_faces()
 
         return jsonify({"success": True, "student": student})
     except (FileNotFoundError, ValueError) as exc:
@@ -420,6 +542,187 @@ def api_register():
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+@app.route("/api/classes", methods=["GET", "POST", "OPTIONS"])
+def api_classes():
+    if request.method == "OPTIONS":
+        return "", 204
+    if request.method == "GET":
+        return jsonify({"items": classes_repo.list_active()})
+
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    grade = (body.get("grade") or "").strip()
+    year = body.get("year")
+    shift = (body.get("shift") or "manha").strip()
+    if not name or not grade or not year:
+        return jsonify({"success": False, "error": "name, grade e year são obrigatórios"}), 400
+    created = classes_repo.create(name=name, grade=grade, year=int(year), shift=shift)
+    if not created:
+        return jsonify({"success": False, "error": "Falha ao criar turma (cloud indisponível?)"}), 502
+    return jsonify({"success": True, "class": created})
+
+
+@app.route("/api/classes/presence", methods=["GET"])
+def api_classes_presence():
+    """Live count of present students per class, sourced from the local cache.
+
+    Works offline. Identical to what the kitchen dispatcher would see right now.
+    """
+    return jsonify({"items": db.count_present_by_class()})
+
+
+@app.route("/api/dietary-restrictions", methods=["GET", "POST", "OPTIONS"])
+def api_dietary_restrictions():
+    if request.method == "OPTIONS":
+        return "", 204
+    if request.method == "GET":
+        return jsonify({"items": dietary_repo.list_active()})
+
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    severity = (body.get("severity") or "atencao").strip()
+    description = body.get("description")
+    if not name:
+        return jsonify({"success": False, "error": "name é obrigatório"}), 400
+    created = dietary_repo.create(name=name, severity=severity, description=description)
+    if not created:
+        return jsonify({"success": False, "error": "Falha ao criar restrição"}), 502
+    return jsonify({"success": True, "restriction": created})
+
+
+@app.route("/api/kitchen/recipients", methods=["GET", "POST", "OPTIONS"])
+def api_kitchen_recipients():
+    if request.method == "OPTIONS":
+        return "", 204
+    if request.method == "GET":
+        return jsonify({"items": kitchen_repo.list_active_recipients()})
+
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    phone = (body.get("phone_e164") or "").strip()
+    channel = (body.get("channel") or "whatsapp").strip()
+    email = body.get("email")
+    if not name or not phone:
+        return jsonify({"success": False, "error": "name e phone_e164 são obrigatórios"}), 400
+    created = kitchen_repo.create_recipient(
+        name=name, phone_e164=phone, channel=channel, email=email
+    )
+    if not created:
+        return jsonify({"success": False, "error": "Falha ao criar destinatário"}), 502
+    return jsonify({"success": True, "recipient": created})
+
+
+@app.route("/api/kitchen/dispatch", methods=["POST", "OPTIONS"])
+def api_kitchen_dispatch():
+    """Manual trigger of the kitchen dispatch for a given shift.
+
+    Body: ``{"shift": "manha"|"tarde"|"noite"|"integral"}``. Idempotent for the
+    same (date, shift) — second call returns ``status=skipped``.
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+    body = request.get_json(silent=True) or {}
+    shift = (body.get("shift") or "manha").strip()
+    result = kitchen_worker.dispatch_now(shift=shift)
+    status_code = 200 if result.get("status") == "sent" else 202
+    return jsonify(result), status_code
+
+
+@app.route("/api/kitchen/dispatches", methods=["GET"])
+def api_kitchen_dispatches():
+    return jsonify({"items": db.list_kitchen_dispatches(limit=30)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Control iD facial collector — online-mode callback
+# ─────────────────────────────────────────────────────────────────────────────
+def _last_direction_today(face_id: str) -> str | None:
+    """Direction of the most recent presence event for ``face_id`` (or None)."""
+    for event in db.get_presence_events(limit=50):
+        if event.get("face_id") == face_id:
+            return event.get("direction")
+    return None
+
+
+def _resolve_direction(person: dict, data: dict) -> str:
+    """Decide entrada/saida from the device payload, falling back to a toggle."""
+    explicit = str(data.get("direction") or "").strip().lower()
+    if explicit in ("entrada", "saida"):
+        return explicit
+    # Control iD portals may send a numeric ``event`` (1=entry, 2=exit).
+    event_code = str(data.get("event") or "").strip()
+    if event_code == "1":
+        return "entrada"
+    if event_code == "2":
+        return "saida"
+    # No hint from the device → toggle from the last recorded direction.
+    return "saida" if _last_direction_today(person["id"]) == "entrada" else "entrada"
+
+
+def _resolve_control_id_user(user_id: str) -> dict | None:
+    """Map a Control iD ``user_id`` to a local person dict.
+
+    The device user_id is provisioned to equal our ``face_id``; if not found
+    locally, we fall back to the cloud (``students.external_id``) and cache the
+    student into the local SQLite store so subsequent lookups are offline-fast.
+    """
+    person = db.get_face(user_id)
+    if person:
+        return person
+
+    student = students_repo.find_by_external_id(user_id)
+    if not student:
+        return None
+
+    face_id = student.get("face_id") or user_id
+    try:
+        db.upsert_face_from_remote(
+            face_id=face_id,
+            supabase_id=str(student["id"]),
+            full_name=student["full_name"],
+            phone=student.get("phone"),
+            email=student.get("email"),
+            encoding=None,
+            class_id=student.get("class_id"),
+            class_name=student.get("class_name"),
+            class_grade=student.get("class_grade"),
+            class_shift=student.get("class_shift"),
+            enrollment_number=student.get("enrollment_number"),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to cache Control iD user %s locally.", user_id)
+    return db.get_face(face_id)
+
+
+@app.route("/new_user_identified.fcgi", methods=["POST", "OPTIONS"])
+def control_id_new_user():
+    """Callback invoked by the Control iD device after it recognizes a face.
+
+    Accepts form-urlencoded or JSON. Records the presence event, fires the
+    WhatsApp notification + outbox sync, and returns the door-release action.
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+
+    data = request.get_json(silent=True) or request.form.to_dict() or {}
+    user_id = str(data.get("user_id") or data.get("id") or "").strip()
+    if not user_id:
+        return jsonify({"result": "error", "message": "user_id ausente"}), 400
+
+    person = _resolve_control_id_user(user_id)
+    if not person:
+        logger.warning("Control iD: usuário %s não cadastrado.", user_id)
+        # Do not open the door for an unknown user.
+        return jsonify({"result": "not_registered", "user_id": user_id}), 200
+
+    direction = _resolve_direction(person, data)
+    _start_event_notification(person, direction, None)
+    logger.info("Control iD: %s registrado (%s).", person.get("full_name"), direction)
+
+    # Door-release action expected by the Control iD device.
+    return jsonify({"actions": [{"action": "door", "parameters": "door=1"}]})
 
 
 if __name__ == "__main__":

@@ -34,6 +34,10 @@ class FaceDatabase:
             self._migration_5_guardians_contacts,
             self._migration_5_message_dispatch_locks,
             self._migration_5_presence_webhook_audit,
+            self._migration_6_outbox,
+            self._migration_7_faces_supabase_id,
+            self._migration_8_faces_class_and_enrollment,
+            self._migration_9_kitchen_dispatches,
         ]
         with self._connect() as conn:
             current_version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -266,6 +270,76 @@ class FaceDatabase:
             if column not in presence_columns:
                 conn.execute(ddl)
 
+    @staticmethod
+    def _migration_6_outbox(conn: sqlite3.Connection) -> None:
+        """Outbox of pending sync operations to push to Supabase."""
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'sent', 'failed')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                next_attempt_at TEXT,
+                created_at TEXT NOT NULL,
+                sent_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS outbox_pending_idx "
+            "ON outbox(status, next_attempt_at) WHERE status = 'pending'"
+        )
+
+    @staticmethod
+    def _migration_7_faces_supabase_id(conn: sqlite3.Connection) -> None:
+        """Cache the Supabase UUID of each face so events can reference it."""
+        existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(faces)").fetchall()}
+        if "supabase_id" not in existing_columns:
+            conn.execute("ALTER TABLE faces ADD COLUMN supabase_id TEXT")
+
+    @staticmethod
+    def _migration_9_kitchen_dispatches(conn: sqlite3.Connection) -> None:
+        """Log of kitchen-message dispatches with a (date, shift) idempotency key."""
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kitchen_dispatches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_date TEXT NOT NULL,
+                shift TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                recipients_count INTEGER NOT NULL DEFAULT 0,
+                present_count INTEGER NOT NULL DEFAULT 0,
+                restrictions_count INTEGER NOT NULL DEFAULT 0,
+                message_body TEXT,
+                triggered_by TEXT NOT NULL DEFAULT 'schedule'
+                    CHECK(triggered_by IN ('schedule', 'manual')),
+                UNIQUE(business_date, shift)
+            )
+            """
+        )
+
+    @staticmethod
+    def _migration_8_faces_class_and_enrollment(conn: sqlite3.Connection) -> None:
+        """Mirror Supabase: cache class_id and enrollment_number locally so the
+        edge can tag presence events and tally class attendance offline."""
+        existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(faces)").fetchall()}
+        for column, ddl in {
+            "class_id": "ALTER TABLE faces ADD COLUMN class_id TEXT",
+            "enrollment_number": "ALTER TABLE faces ADD COLUMN enrollment_number TEXT",
+            "class_name": "ALTER TABLE faces ADD COLUMN class_name TEXT",
+            "class_grade": "ALTER TABLE faces ADD COLUMN class_grade TEXT",
+            "class_shift": "ALTER TABLE faces ADD COLUMN class_shift TEXT",
+        }.items():
+            if column not in existing_columns:
+                conn.execute(ddl)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS faces_class_id_idx ON faces(class_id)"
+        )
+
     def add_face(
         self,
         face_id: str,
@@ -275,6 +349,8 @@ class FaceDatabase:
         notes: str = "",
         photo_path: str | None = None,
         encoding: list[float] | None = None,
+        class_id: str | None = None,
+        enrollment_number: str | None = None,
     ) -> bool:
         try:
             with self._connect() as conn:
@@ -282,8 +358,8 @@ class FaceDatabase:
                     """
                     INSERT INTO faces (
                         id, full_name, phone, email, notes, photo_path,
-                        encoding_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        encoding_json, created_at, class_id, enrollment_number
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         face_id,
@@ -294,6 +370,8 @@ class FaceDatabase:
                         photo_path,
                         json.dumps(encoding) if encoding is not None else None,
                         datetime.now(timezone.utc).isoformat(),
+                        class_id,
+                        enrollment_number,
                     ),
                 )
                 conn.commit()
@@ -325,7 +403,8 @@ class FaceDatabase:
 
     def update_face(self, face_id: str, **kwargs: Any) -> bool:
         allowed = {
-            "full_name", "phone", "email", "notes", "photo_path", "active", "encoding"
+            "full_name", "phone", "email", "notes", "photo_path", "active", "encoding",
+            "class_id", "enrollment_number", "class_name", "class_grade", "class_shift",
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
@@ -682,8 +761,16 @@ class FaceDatabase:
                 if elapsed < cooldown_seconds:
                     conn.commit()
                     return False, "cooldown"
+                conn.execute(
+                    """
+                    UPDATE message_dispatch_locks
+                    SET last_sent_at = ?
+                    WHERE face_id = ? AND direction = ? AND business_date = ?
+                    """,
+                    (now_iso, face_id, direction, business_date),
+                )
                 conn.commit()
-                return False, "already_sent"
+                return True, "reserved"
 
             try:
                 conn.execute(
@@ -699,6 +786,313 @@ class FaceDatabase:
                 conn.commit()
                 return False, "duplicate"
 
+    # ------------------------------------------------------------------
+    # Outbox: queued sync operations to push to Supabase
+    # ------------------------------------------------------------------
+    def enqueue_outbox(self, kind: str, payload: dict) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO outbox (kind, payload_json, status, created_at, next_attempt_at)
+                VALUES (?, ?, 'pending', ?, ?)
+                """,
+                (
+                    kind,
+                    json.dumps(payload),
+                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def fetch_pending_outbox(self, limit: int = 50) -> list[dict[str, Any]]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, kind, payload_json, attempts, next_attempt_at
+                FROM outbox
+                WHERE status = 'pending'
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                (now_iso, limit),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "kind": row["kind"],
+                "payload": json.loads(row["payload_json"]),
+                "attempts": int(row["attempts"]),
+            }
+            for row in rows
+        ]
+
+    def mark_outbox_sent(self, outbox_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE outbox
+                SET status = 'sent', sent_at = ?, last_error = NULL
+                WHERE id = ?
+                """,
+                (datetime.now(timezone.utc).isoformat(), outbox_id),
+            )
+            conn.commit()
+
+    def mark_outbox_failed(
+        self,
+        outbox_id: int,
+        error: str,
+        retry_in_seconds: float | None = None,
+    ) -> None:
+        from datetime import timedelta
+
+        next_attempt = None
+        if retry_in_seconds is not None and retry_in_seconds > 0:
+            next_attempt = (
+                datetime.now(timezone.utc) + timedelta(seconds=retry_in_seconds)
+            ).isoformat()
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE outbox
+                SET attempts = attempts + 1,
+                    last_error = ?,
+                    next_attempt_at = ?
+                WHERE id = ?
+                """,
+                (error[:1000], next_attempt, outbox_id),
+            )
+            conn.commit()
+
+    # ------------------------------------------------------------------
+    # Kitchen dispatches (idempotency by (date, shift))
+    # ------------------------------------------------------------------
+    def try_record_kitchen_dispatch(
+        self,
+        business_date: str,
+        shift: str,
+        triggered_by: str,
+    ) -> bool:
+        """Insert a dispatch row; returns False if one already exists for the
+        same business_date + shift (so we don't double-send)."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO kitchen_dispatches (
+                        business_date, shift, sent_at, triggered_by
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        business_date,
+                        shift,
+                        datetime.now(timezone.utc).isoformat(),
+                        triggered_by,
+                    ),
+                )
+                conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def finalize_kitchen_dispatch(
+        self,
+        business_date: str,
+        shift: str,
+        recipients_count: int,
+        present_count: int,
+        restrictions_count: int,
+        message_body: str,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE kitchen_dispatches
+                SET recipients_count = ?, present_count = ?,
+                    restrictions_count = ?, message_body = ?
+                WHERE business_date = ? AND shift = ?
+                """,
+                (
+                    recipients_count,
+                    present_count,
+                    restrictions_count,
+                    message_body,
+                    business_date,
+                    shift,
+                ),
+            )
+            conn.commit()
+
+    def list_kitchen_dispatches(self, limit: int = 30) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM kitchen_dispatches
+                ORDER BY business_date DESC, shift ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Cached Supabase id for a face (used to reference student in events)
+    # ------------------------------------------------------------------
+    def set_face_supabase_id(self, face_id: str, supabase_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE faces SET supabase_id = ? WHERE id = ?",
+                (supabase_id, face_id),
+            )
+            conn.commit()
+
+    def get_face_supabase_id(self, face_id: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT supabase_id FROM faces WHERE id = ?",
+                (face_id,),
+            ).fetchone()
+        return row["supabase_id"] if row and row["supabase_id"] else None
+
+    def upsert_face_from_remote(
+        self,
+        face_id: str,
+        supabase_id: str,
+        full_name: str,
+        phone: str | None,
+        email: str | None,
+        encoding: list[float] | None,
+        class_id: str | None = None,
+        class_name: str | None = None,
+        class_grade: str | None = None,
+        class_shift: str | None = None,
+        enrollment_number: str | None = None,
+    ) -> None:
+        """Insert/update a face row from a remote reconciliation pull."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM faces WHERE id = ?", (face_id,)
+            ).fetchone()
+            payload_encoding = json.dumps(encoding) if encoding else None
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE faces
+                    SET full_name = ?, phone = ?, email = ?,
+                        encoding_json = COALESCE(?, encoding_json),
+                        supabase_id = ?, active = 1,
+                        class_id = ?, class_name = ?, class_grade = ?, class_shift = ?,
+                        enrollment_number = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        full_name,
+                        phone or "",
+                        email or "",
+                        payload_encoding,
+                        supabase_id,
+                        class_id,
+                        class_name,
+                        class_grade,
+                        class_shift,
+                        enrollment_number,
+                        face_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO faces (
+                        id, full_name, phone, email, encoding_json,
+                        supabase_id, created_at, active,
+                        class_id, class_name, class_grade, class_shift,
+                        enrollment_number
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        face_id,
+                        full_name,
+                        phone or "",
+                        email or "",
+                        payload_encoding,
+                        supabase_id,
+                        now_iso,
+                        class_id,
+                        class_name,
+                        class_grade,
+                        class_shift,
+                        enrollment_number,
+                    ),
+                )
+            conn.commit()
+
+    def count_present_by_class(self) -> list[dict[str, Any]]:
+        """Per-class snapshot of who is currently in school (offline-safe).
+
+        "Present" = today's row has first_entry_at set and (no last_exit_at OR
+        last_exit_at < first_entry_at). Output is one row per class with a
+        nested ``students`` array — used both by the panel and the kitchen
+        dispatcher.
+        """
+        today = datetime.now(ZoneInfo(self.attendance_timezone)).date().isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    f.class_id, f.class_name, f.class_grade, f.class_shift,
+                    f.id AS face_id, f.supabase_id, f.full_name, f.enrollment_number,
+                    da.first_entry_at, da.last_exit_at
+                FROM faces f
+                JOIN daily_attendance da
+                  ON da.face_id = f.id AND da.attendance_date = ?
+                WHERE f.active = 1
+                  AND da.first_entry_at IS NOT NULL
+                  AND (da.last_exit_at IS NULL OR da.last_exit_at < da.first_entry_at)
+                """,
+                (today,),
+            ).fetchall()
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            key = row["class_id"] or "__unassigned__"
+            bucket = grouped.setdefault(
+                key,
+                {
+                    "class_id": row["class_id"],
+                    "class_name": row["class_name"],
+                    "class_grade": row["class_grade"],
+                    "class_shift": row["class_shift"],
+                    "students": [],
+                },
+            )
+            bucket["students"].append(
+                {
+                    "face_id": row["face_id"],
+                    "supabase_id": row["supabase_id"],
+                    "full_name": row["full_name"],
+                    "enrollment_number": row["enrollment_number"],
+                    "first_entry_at": row["first_entry_at"],
+                }
+            )
+
+        result = list(grouped.values())
+        for bucket in result:
+            bucket["present_count"] = len(bucket["students"])
+        result.sort(
+            key=lambda b: (
+                b.get("class_grade") or "",
+                b.get("class_name") or "",
+            )
+        )
+        return result
+
     @staticmethod
     def _row_to_face(row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
@@ -709,4 +1103,6 @@ class FaceDatabase:
             data["encoding"] = json.loads(data["encoding_json"])
         else:
             data["encoding"] = None
+        # supabase_id key is normalized so callers don't need to check for absence
+        data.setdefault("supabase_id", None)
         return data

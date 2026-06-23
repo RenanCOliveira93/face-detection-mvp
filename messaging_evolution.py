@@ -15,25 +15,9 @@ if importlib.util.find_spec("dotenv") is not None:
     dotenv.load_dotenv()
 
 
-def normalize_phone(phone: str) -> str:
-    digits = re.sub(r"\D", "", phone or "")
-    if not digits:
-        return ""
-    if not digits.startswith("55"):
-        digits = "55" + digits
-    return digits
-
-
-def _build_response(success: bool, request_id: str, raw_response: Any) -> tuple[bool, dict[str, Any]]:
-    return success, {
-        "success": success,
-        "provider": "evolution",
-        "request_id": request_id,
-        "raw_response": raw_response,
-    }
-
-
 def send_via_evolution(phone: str, message: str) -> tuple[bool, dict[str, Any]]:
+    from messaging import normalize_phone
+
     base_url = os.getenv("EVOLUTION_API_URL", "").strip().rstrip("/")
     api_key = os.getenv("EVOLUTION_API_KEY", "").strip()
     instance = os.getenv("EVOLUTION_INSTANCE", "").strip()
