@@ -415,7 +415,10 @@ def api_status():
                 "message_sent": state["last_message_sent"],
                 "message_info": state["last_message_info"],
                 "match_score": state["latest_match_score"],
-                "registered_faces": len(registry.known_faces()),
+                "registered_faces": (
+                    len(registry.known_faces()) if registry is not None
+                    else len(db.list_faces())
+                ),
                 "last_event_direction": state["last_event_direction"],
                 "last_event_at": state["last_event_at"],
                 "active_tracks": len(active_presence_tracks),
