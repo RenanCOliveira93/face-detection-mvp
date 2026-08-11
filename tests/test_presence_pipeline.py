@@ -64,7 +64,39 @@ class PresencePipelineIntegrationTests(unittest.TestCase):
     def test_migrations_set_user_version(self) -> None:
         with self.db._connect() as conn:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-        self.assertEqual(version, 5)
+        self.assertGreaterEqual(version, 10)
+        with self.db._connect() as conn:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertTrue({"schools", "devices", "sync_outbox", "dietary_restrictions"} <= tables)
+
+    def test_school_classroom_count_and_teacher_notes_are_tenant_scoped(self) -> None:
+        school = self.db.create_school("Escola Teste", "escola-teste", "school-secret")
+        other = self.db.create_school("Outra Escola", "outra-escola", "other-secret")
+        member_id = self.db.add_school_member(
+            school["id"], "Professora Ana", "ana@example.com", "professor"
+        )["id"]
+        classroom_id = self.db.create_classroom(school["id"], "5º A", "2026")
+        self.assertTrue(self.db.assign_face_to_school("stu-1", school["id"]))
+        self.db.enroll_student(school["id"], classroom_id, "stu-1")
+        note_id = self.db.add_teacher_note(
+            school["id"], member_id, "Participou bem da atividade", face_id="stu-1"
+        )
+
+        dashboard = self.db.get_school_dashboard(school["id"])
+        other_dashboard = self.db.get_school_dashboard(other["id"])
+        self.assertEqual(dashboard["students"], 1)
+        self.assertEqual(dashboard["classrooms"][0]["student_count"], 1)
+        self.assertEqual(dashboard["notes"][0]["id"], note_id)
+        self.assertEqual(other_dashboard["students"], 0)
+        self.assertEqual(other_dashboard["notes"], [])
+
+    def test_cross_school_enrollment_is_rejected(self) -> None:
+        school = self.db.create_school("Escola A", "escola-a")
+        other = self.db.create_school("Escola B", "escola-b")
+        classroom_id = self.db.create_classroom(other["id"], "1º B", "2026")
+        self.db.assign_face_to_school("stu-1", school["id"])
+        with self.assertRaises(ValueError):
+            self.db.enroll_student(other["id"], classroom_id, "stu-1")
 
     def test_daily_attendance_same_day_entry_and_exit(self) -> None:
         self.db.create_presence_event(

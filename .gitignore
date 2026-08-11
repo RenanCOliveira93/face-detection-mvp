@@ -23,5 +23,7 @@ env/
 
 database/
 storage/
+models/*.pkl
+*.db
 scripts/database/
 scripts/storage/

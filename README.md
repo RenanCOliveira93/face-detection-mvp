@@ -1,128 +1,104 @@
-# Face Detection MVP para escola
+# School Face Presence POC
 
-Sistema simples de reconhecimento facial de alunos com **uma foto por aluno** e disparo de mensagem no **WhatsApp do responsável**.
+POC local-first para reconhecimento simultâneo de alunos, presença escolar, Control iD, responsáveis e cozinha. **Não é um produto certificado nem conformidade integral com LGPD.**
 
-## O que mudou
+## Arquitetura e fonte de verdade
 
-- Não existe mais etapa de treinamento com várias imagens.
-- Cada aluno é cadastrado com uma única foto.
-- No cadastro, a foto é vetorizada e o embedding fica salvo no SQLite.
-- Na câmera, cada rosto detectado é comparado por similaridade com os embeddings cadastrados.
-- O envio de mensagem suporta **Meta WhatsApp Cloud API**, **Evolution API** ou **modo mock**.
-- O roteador usa prioridade: `MOCK_MESSAGES` -> `USE_EVOLUTION_API` -> `USE_META_WHATSAPP`.
+`OpenCV/câmera -> recognition_pipeline -> Flask -> SQLite local -> outbox -> PostgreSQL central`.
+SQLite é a fonte operacional da unidade: a portaria continua registrando eventos sem internet. PostgreSQL recebe cópias idempotentes para consolidação; nunca decide a abertura local. `event_key` é único no local e chave primária no central. Cadastros administrativos também são locais nesta POC; não há sincronização bidirecional.
 
-## Fluxo (entrada/saída + telemetria operacional)
+## Pré-requisitos
 
-1. Cadastrar aluno com nome, telefone do responsável e uma foto.
-2. Salvar foto original em `storage/faces/`.
-3. Salvar embedding facial no banco `database/faces.db`.
-4. Ao detectar um rosto na webcam, calcular embedding do frame atual.
-5. Comparar com os embeddings cadastrados.
-6. Se a distância ficar abaixo do threshold (`RECOGNITION_TOLERANCE`), reconhecer o aluno e abrir uma trilha ativa de presença.
-7. Registrar evento de **entrada** persistido no SQLite (`presence_events`).
-8. Se o aluno ficar sem detecção por alguns segundos, encerrar a trilha ativa e registrar evento de **saída** persistido.
-9. Atualizar o painel (`/api/status`) com `last_event_direction`, `last_event_at`, `active_tracks` e resumo por aluno.
-10. Enviar mensagens de **entrada e saída** (`chegou` / `saiu`) com cooldown por direção (ex.: `aluno-1:entrada` e `aluno-1:saida`).
-11. Auditar no próprio evento de presença os campos `message_ok`, `message_info` e `message_sent_at`.
+- Python 3.11–3.13 (dlib 19.24.6; Python 3.14 não é suportado pelo stack de câmera)
+- Linux/macOS, CMake e compilador C++ para dlib
+- câmera USB/IP; PostgreSQL 14+ é opcional
 
-## Configuração
-
-Crie um `.env` com algo como:
-
-```env
-PORT=5000
-CAMERA_INDEX=0
-RECOGNITION_TOLERANCE=0.45
-MESSAGE_COOLDOWN=60
-FACE_IMAGES_DIR=storage/faces
-
-# Para testes locais
-MOCK_MESSAGES=true
-
-# Para WhatsApp real via Evolution API
-USE_EVOLUTION_API=false
-EVOLUTION_BASE_URL=
-EVOLUTION_API_KEY=
-EVOLUTION_INSTANCE=
-
-# Para WhatsApp real pela Meta
-USE_META_WHATSAPP=false
-META_WHATSAPP_TOKEN=
-META_PHONE_NUMBER_ID=
-META_API_VERSION=v19.0
-DEFAULT_RECIPIENT=
-```
-
-## Instalação
+## Instalação limpa
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/RenanCOliveira93/face-detection-mvp.git
+cd face-detection-mvp
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+python -m unittest discover -s tests -v
 ```
 
-## Cadastrar um aluno
+Configure `ADMIN_BOOTSTRAP_TOKEN` com 32+ bytes aleatórios, `MOCK_MESSAGES=true`, timezone, câmera e, opcionalmente, `POSTGRES_DSN`. Inicie com `python main.py`; consulte `curl http://127.0.0.1:5000/api/status`.
+
+## Provisionamento e fluxo reproduzível
 
 ```bash
-python scripts/register_face.py --name "Maria Souza" --phone "5511999999999" --image "/caminho/maria.jpg"
+# Primeira escola + administrador (as chaves só aparecem na criação)
+curl -sS -X POST localhost:5000/api/schools -H 'Content-Type: application/json' \
+ -H 'X-Bootstrap-Token: SEU_BOOTSTRAP' \
+ -d '{"name":"Escola POC","slug":"escola-poc","timezone":"America/Sao_Paulo","admin_name":"Admin","admin_email":"admin@example.test"}'
+export SCHOOL_KEY='api_key do admin retornado'
+
+# Professor e turma
+curl -X POST localhost:5000/api/school/members -H "X-School-Key: $SCHOOL_KEY" -H 'Content-Type: application/json' \
+ -d '{"full_name":"Professora Ana","email":"ana@example.test","role":"professor"}'
+curl -X POST localhost:5000/api/classes -H "X-School-Key: $SCHOOL_KEY" -H 'Content-Type: application/json' \
+ -d '{"name":"5 A","school_year":"2026"}'
+
+# Aluno/responsável: o telefone informado é migrado para o contato de responsável
+curl -X POST localhost:5000/api/register -H "X-School-Key: $SCHOOL_KEY" \
+ -F 'name=Aluno POC' -F 'phone=5511999999999' -F 'id=aluno-poc' -F 'image=@foto-com-consentimento.jpg'
+curl -X POST localhost:5000/api/school/classrooms/1/students -H "X-School-Key: $SCHOOL_KEY" \
+ -H 'Content-Type: application/json' -d '{"face_id":"aluno-poc"}'
+
+# Restrição e nota (nota deve usar a chave retornada ao criar o professor)
+curl -X POST localhost:5000/api/dietary-restrictions -H "X-School-Key: $SCHOOL_KEY" \
+ -H 'Content-Type: application/json' -d '{"face_id":"aluno-poc","description":"Alergia a amendoim","severity":"alta"}'
+curl -X POST localhost:5000/api/school/notes -H 'X-School-Key: CHAVE_PROFESSOR' \
+ -H 'Content-Type: application/json' -d '{"face_id":"aluno-poc","body":"Participou da atividade"}'
+
+# Dashboard e cozinha mock
+curl localhost:5000/api/school/dashboard -H "X-School-Key: $SCHOOL_KEY"
+curl -X POST localhost:5000/api/kitchen/recipients -H "X-School-Key: $SCHOOL_KEY" \
+ -H 'Content-Type: application/json' -d '{"name":"Cozinha","phone":"5511888888888"}'
+curl -X POST localhost:5000/api/kitchen/dispatch -H "X-School-Key: $SCHOOL_KEY" -H 'Content-Type: application/json' -d '{}'
 ```
 
-Se preferir, rode sem argumentos e responda interativamente:
+## Control iD seguro
+
+Cadastre o dispositivo por uma rotina administrativa usando `FaceDatabase.create_device`. O callback exige identidade e segredo do dispositivo, `event_id` único (anti-replay/idempotência) e aluno da mesma escola:
 
 ```bash
-python scripts/register_face.py
+curl -X POST localhost:5000/new_user_identified.fcgi \
+ -H 'X-Device-Id: portaria-1' -H 'X-Device-Secret: SEGREDO_DO_DISPOSITIVO' \
+ -H 'Content-Type: application/json' \
+ -d '{"event_id":"terminal-0001","user_id":"aluno-poc","event_at":"2026-08-11T12:00:00Z"}'
 ```
 
-## Rodar a aplicação
+Use HTTPS, VLAN/allowlist no proxy e nunca exponha o Flask diretamente à internet. A resposta `access=granted` só ocorre após autenticação, vínculo escolar e deduplicação. A abertura elétrica real permanece responsabilidade do controlador/rede homologados.
+
+## PostgreSQL e offline
+
+Execute `python scripts/sync_outbox.py`. Na indisponibilidade, presença continua no SQLite e itens permanecem `pending`; no retorno, reexecute. O `ON CONFLICT` central previne duplicidade. Turmas/restrições são criadas localmente e funcionam offline, mas **não são enviadas ao central nesta POC**; somente eventos colocados explicitamente na outbox são sincronizados.
+
+| Recurso | Sem PostgreSQL | Com PostgreSQL |
+|---|---:|---:|
+| reconhecimento/presença/Control iD | sim | sim + cópia central |
+| mensagens/webhook | sim, conforme conectividade do provedor | igual |
+| turmas, notas, restrições, cozinha mock | sim, local | local |
+| consolidação multiunidade central | não | eventos de presença |
+
+## Segurança, biometria e LGPD mínima
+
+Finalidade limitada: controle de presença com consentimento verificável do responsável. Colete uma foto adequada, minimize acessos e defina retenção com a escola. Chaves são armazenadas como SHA-256; valores originais só são retornados ao provisionar. Use disco criptografado, backup cifrado/testado, HTTPS, rotação/revogação de chaves e logs sem PII. `DELETE /api/school/students/<id>` anonimiza PII/embedding, remove foto local e vínculos, preservando auditoria não identificada. Defina procedimento de incidente (isolar, preservar evidência, rotacionar, avaliar titulares/ANPD). O arquivo biométrico legado foi removido do estado atual, mas removê-lo do histórico remoto exigiria reescrita separada e autorização.
+
+## Testes, rollback e troubleshooting
 
 ```bash
-python main.py
+python -m unittest discover -s tests -v
+python -m py_compile main.py database.py config.py integrations/webhook_client.py recognition_pipeline.py sync_service.py
+python scripts/smoke_poc.py
+git diff --check
 ```
 
-Abra `http://localhost:5000`.
+Rollback: pare o serviço, faça backup de `database/faces.db`, restaure o commit/aplicação anterior e o backup compatível. Migrações SQLite são progressivas e não têm downgrade automático. Se câmera falhar, valide `CAMERA_INDEX`, permissões e iluminação. Se PostgreSQL falhar, consulte `sync_outbox.last_error`. `401` indica chave ausente/inválida; `403`, papel ou escola incorretos.
 
-## Testar o WhatsApp
+## Limitações e homologação física
 
-```bash
-python scripts/test_messaging.py
-```
-
-## Observações importantes
-
-- A foto de cadastro deve conter **apenas um rosto**.
-- O threshold ideal depende da câmera e iluminação; comece em `0.45`.
-- Em `MOCK_MESSAGES=true`, nenhuma mensagem real é enviada.
-- Para produção, o canal recomendado aqui é a **Meta WhatsApp Cloud API**.
-
-
-## Migrações de banco
-
-O schema agora é versionado com `PRAGMA user_version` e migrações sequenciais automáticas na inicialização (`FaceDatabase`).
-Isso evita divergência de colunas/tabelas em bancos legados e inclui a tabela `presence_events` para auditoria completa de entrada/saída.
-
-## Validar Evolution em homologação
-
-1. Configure no `.env`:
-
-```env
-MOCK_MESSAGES=false
-USE_EVOLUTION_API=true
-EVOLUTION_BASE_URL=http://localhost:8080
-EVOLUTION_API_KEY=seu-token
-EVOLUTION_INSTANCE=instancia-hml
-```
-
-2. Execute um disparo de teste sem enviar (validação de argumentos):
-
-```bash
-python scripts/send_evolution_message.py --phone 5511999999999 --message "Teste homologação" --dry-run
-```
-
-3. Execute o disparo real:
-
-```bash
-python scripts/send_evolution_message.py --phone 5511999999999 --message "Teste homologação"
-```
-
-4. Verifique no retorno os campos padronizados para auditoria: `success`, `provider`, `request_id`, `raw_response`.
-
+Não há quantidade universal de rostos simultâneos: homologue CPU/GPU, resolução, distância, ângulo, iluminação, oclusão, falsos positivos/negativos e tempo de resposta. Teste queda de energia/rede, reinício, virada do dia/timezone, saída de emergência, acesso manual, câmera indisponível, Control iD/VLAN/HTTPS, WhatsApp homologado, backup/restauração e consentimento/retenção. Não use reconhecimento como único mecanismo para decisões disciplinares ou de segurança física.

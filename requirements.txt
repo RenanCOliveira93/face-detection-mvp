@@ -7,6 +7,7 @@ numpy>=1.24.0
 # ── Web / API ─────────────────────────────────────────────────
 flask>=3.0.0
 requests>=2.31.0
+psycopg[binary]>=3.2.0          # sincronização opcional com PostgreSQL central
 
 # ── Utilitários ───────────────────────────────────────────────
 python-dotenv>=1.0.0

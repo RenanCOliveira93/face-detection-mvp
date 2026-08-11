@@ -31,6 +31,8 @@ def _build_payload(event: dict[str, Any], person: dict[str, Any], source: str) -
         "full_name": person.get("full_name"),
         "phone": person.get("phone"),
         "source": source,
+        "school_id": event.get("school_id") or person.get("school_id"),
+        "device_id": event.get("device_id"),
     }
 
 
