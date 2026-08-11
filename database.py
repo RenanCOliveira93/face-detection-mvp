@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sqlite3
+import hashlib
 from datetime import datetime, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -13,6 +15,7 @@ DB_PATH = "database/faces.db"
 
 
 class FaceDatabase:
+    SCHEMA_VERSION = 10
     def __init__(self, db_path: str = DB_PATH, attendance_timezone: str = "UTC"):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.db_path = db_path
@@ -34,7 +37,11 @@ class FaceDatabase:
             self._migration_5_guardians_contacts,
             self._migration_5_message_dispatch_locks,
             self._migration_5_presence_webhook_audit,
+            self._migration_9_school_management,
+            self._migration_10_secure_school_operations,
         ]
+        if len(migrations) != self.SCHEMA_VERSION:
+            raise RuntimeError("SCHEMA_VERSION não corresponde à lista de migrações")
         with self._connect() as conn:
             current_version = conn.execute("PRAGMA user_version").fetchone()[0]
             for version, migration in enumerate(migrations, start=1):
@@ -219,7 +226,7 @@ class FaceDatabase:
                 (guardian_name, now_iso),
             )
             guardian_id = int(cursor.lastrowid)
-            conn.execute(
+            cur = conn.execute(
                 """
                 INSERT INTO guardian_phones (
                     guardian_id, phone_e164, is_primary, channel, active, created_at
@@ -266,6 +273,542 @@ class FaceDatabase:
             if column not in presence_columns:
                 conn.execute(ddl)
 
+    @staticmethod
+    def _migration_9_school_management(conn: sqlite3.Connection) -> None:
+        """Cria a camada multi-escola sem invalidar cadastros legados."""
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS schools (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                api_key TEXT NOT NULL UNIQUE,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS school_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                school_id INTEGER NOT NULL,
+                full_name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('admin', 'professor')),
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE(school_id, email),
+                FOREIGN KEY (school_id) REFERENCES schools(id)
+            );
+            CREATE TABLE IF NOT EXISTS classrooms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                school_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                school_year TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE(school_id, name, school_year),
+                FOREIGN KEY (school_id) REFERENCES schools(id)
+            );
+            CREATE TABLE IF NOT EXISTS classroom_students (
+                classroom_id INTEGER NOT NULL,
+                face_id TEXT NOT NULL,
+                enrolled_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (classroom_id, face_id),
+                FOREIGN KEY (classroom_id) REFERENCES classrooms(id),
+                FOREIGN KEY (face_id) REFERENCES faces(id)
+            );
+            CREATE TABLE IF NOT EXISTS teacher_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                school_id INTEGER NOT NULL,
+                member_id INTEGER NOT NULL,
+                face_id TEXT,
+                classroom_id INTEGER,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                CHECK(face_id IS NOT NULL OR classroom_id IS NOT NULL),
+                FOREIGN KEY (school_id) REFERENCES schools(id),
+                FOREIGN KEY (member_id) REFERENCES school_members(id),
+                FOREIGN KEY (face_id) REFERENCES faces(id),
+                FOREIGN KEY (classroom_id) REFERENCES classrooms(id)
+            );
+            """
+        )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(faces)").fetchall()}
+        if "school_id" not in columns:
+            conn.execute("ALTER TABLE faces ADD COLUMN school_id INTEGER REFERENCES schools(id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_faces_school ON faces(school_id, active)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notes_school ON teacher_notes(school_id, created_at)"
+        )
+
+    @staticmethod
+    def _migration_10_secure_school_operations(conn: sqlite3.Connection) -> None:
+        """Add secure principals and local-first operational tables."""
+        school_columns = {row[1] for row in conn.execute("PRAGMA table_info(schools)")}
+        if "timezone" not in school_columns:
+            conn.execute("ALTER TABLE schools ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'")
+        if "api_key_hash" not in school_columns:
+            conn.execute("ALTER TABLE schools ADD COLUMN api_key_hash TEXT")
+        member_columns = {row[1] for row in conn.execute("PRAGMA table_info(school_members)")}
+        if "api_key_hash" not in member_columns:
+            conn.execute("ALTER TABLE school_members ADD COLUMN api_key_hash TEXT")
+        presence_columns = {row[1] for row in conn.execute("PRAGMA table_info(presence_events)")}
+        for column, ddl in {
+            "school_id": "ALTER TABLE presence_events ADD COLUMN school_id INTEGER REFERENCES schools(id)",
+            "device_id": "ALTER TABLE presence_events ADD COLUMN device_id TEXT",
+            "idempotency_key": "ALTER TABLE presence_events ADD COLUMN idempotency_key TEXT",
+        }.items():
+            if column not in presence_columns:
+                conn.execute(ddl)
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS dietary_restrictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, school_id INTEGER NOT NULL,
+                face_id TEXT NOT NULL, description TEXT NOT NULL, severity TEXT NOT NULL DEFAULT 'atenção',
+                active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
+                FOREIGN KEY(school_id) REFERENCES schools(id), FOREIGN KEY(face_id) REFERENCES faces(id)
+            );
+            CREATE TABLE IF NOT EXISTS devices (
+                id TEXT PRIMARY KEY, school_id INTEGER NOT NULL, name TEXT NOT NULL,
+                secret_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
+                FOREIGN KEY(school_id) REFERENCES schools(id)
+            );
+            CREATE TABLE IF NOT EXISTS device_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, device_id TEXT NOT NULL, external_id TEXT NOT NULL,
+                face_id TEXT NOT NULL, presence_event_id INTEGER, created_at TEXT NOT NULL,
+                UNIQUE(device_id, external_id), FOREIGN KEY(device_id) REFERENCES devices(id)
+            );
+            CREATE TABLE IF NOT EXISTS kitchen_recipients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, school_id INTEGER NOT NULL,
+                name TEXT NOT NULL, phone TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL, FOREIGN KEY(school_id) REFERENCES schools(id)
+            );
+            CREATE TABLE IF NOT EXISTS kitchen_dispatches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, school_id INTEGER NOT NULL,
+                business_date TEXT NOT NULL, payload_json TEXT NOT NULL, status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                UNIQUE(school_id, business_date), FOREIGN KEY(school_id) REFERENCES schools(id)
+            );
+            CREATE TABLE IF NOT EXISTS sync_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, school_id INTEGER NOT NULL,
+                event_key TEXT NOT NULL UNIQUE, aggregate_type TEXT NOT NULL, payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT, created_at TEXT NOT NULL, processed_at TEXT,
+                FOREIGN KEY(school_id) REFERENCES schools(id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_presence_idempotency
+              ON presence_events(idempotency_key) WHERE idempotency_key IS NOT NULL;
+            CREATE TRIGGER IF NOT EXISTS reject_cross_school_enrollment
+            BEFORE INSERT ON classroom_students BEGIN
+              SELECT CASE WHEN (SELECT school_id FROM classrooms WHERE id=NEW.classroom_id)
+                IS NOT (SELECT school_id FROM faces WHERE id=NEW.face_id)
+                THEN RAISE(ABORT, 'cross-school enrollment') END;
+            END;
+            CREATE TRIGGER IF NOT EXISTS reject_cross_school_restriction
+            BEFORE INSERT ON dietary_restrictions BEGIN
+              SELECT CASE WHEN NEW.school_id IS NOT (SELECT school_id FROM faces WHERE id=NEW.face_id)
+                THEN RAISE(ABORT, 'cross-school restriction') END;
+            END;
+            CREATE TRIGGER IF NOT EXISTS reject_cross_school_note
+            BEFORE INSERT ON teacher_notes BEGIN
+              SELECT CASE WHEN NEW.face_id IS NOT NULL AND NEW.school_id IS NOT
+                (SELECT school_id FROM faces WHERE id=NEW.face_id)
+                THEN RAISE(ABORT, 'cross-school note') END;
+              SELECT CASE WHEN NEW.classroom_id IS NOT NULL AND NEW.school_id IS NOT
+                (SELECT school_id FROM classrooms WHERE id=NEW.classroom_id)
+                THEN RAISE(ABORT, 'cross-school note') END;
+            END;
+            """
+        )
+
+    @staticmethod
+    def hash_secret(secret: str) -> str:
+        return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+    def create_school(
+        self, name: str, slug: str, api_key: str | None = None, timezone_name: str = "UTC"
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        key = api_key or secrets.token_urlsafe(32)
+        ZoneInfo(timezone_name)
+        key_hash = self.hash_secret(key)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO schools
+                   (name, slug, api_key, api_key_hash, timezone, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (name.strip(), slug.strip().lower(), key_hash, key_hash, timezone_name, now),
+            )
+            conn.commit()
+            return {
+                "id": int(cursor.lastrowid), "name": name.strip(), "slug": slug,
+                "timezone": timezone_name, "api_key": key,
+            }
+
+    def get_school_by_api_key(self, api_key: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT id, name, slug, timezone FROM schools
+                   WHERE (api_key_hash = ? OR (api_key_hash IS NULL AND api_key = ?)) AND active = 1""",
+                (self.hash_secret(api_key), api_key),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def add_school_member(
+        self, school_id: int, full_name: str, email: str, role: str, api_key: str | None = None
+    ) -> dict[str, Any]:
+        if role not in {"school_admin", "professor"}:
+            raise ValueError("Perfil inválido")
+        if not full_name.strip() or not email.strip():
+            raise ValueError("Nome e e-mail do membro são obrigatórios")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """INSERT INTO school_members
+                   (school_id, full_name, email, role, api_key_hash, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    school_id,
+                    full_name.strip(),
+                    email.strip().lower(),
+                    "admin" if role == "school_admin" else role,
+                    self.hash_secret(api_key or (key := secrets.token_urlsafe(32))),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+            return {"id": int(cursor.lastrowid), "api_key": api_key or key, "role": role}
+
+    def authenticate_principal(self, api_key: str) -> dict[str, Any] | None:
+        digest = self.hash_secret(api_key)
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT m.id AS member_id, m.school_id, m.full_name, m.role, s.timezone
+                   FROM school_members m JOIN schools s ON s.id=m.school_id
+                   WHERE m.api_key_hash=? AND m.active=1 AND s.active=1""", (digest,)
+            ).fetchone()
+        result = dict(row) if row else None
+        if result and result["role"] == "admin":
+            result["role"] = "school_admin"
+        return result
+
+    def revoke_member(self, school_id: int, member_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE school_members SET active=0 WHERE id=? AND school_id=?", (member_id, school_id)
+            )
+            conn.commit()
+            return cur.rowcount == 1
+
+    def list_school_members(self, school_id: int) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                """SELECT id,full_name,email,CASE role WHEN 'admin' THEN 'school_admin' ELSE role END role,
+                          active,created_at FROM school_members WHERE school_id=? ORDER BY full_name""",
+                (school_id,),
+            )]
+
+    def create_classroom(self, school_id: int, name: str, school_year: str = "") -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO classrooms (school_id, name, school_year, created_at) VALUES (?, ?, ?, ?)",
+                (school_id, name.strip(), school_year.strip(), datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def add_kitchen_recipient(self, school_id: int, name: str, phone: str) -> int:
+        if not name.strip() or not phone.strip():
+            raise ValueError("Nome e telefone são obrigatórios")
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO kitchen_recipients(school_id,name,phone,created_at)
+                   VALUES(?,?,?,?)""", (school_id, name.strip(), phone.strip(), datetime.now(timezone.utc).isoformat())
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def prepare_kitchen_dispatch(self, school_id: int, business_date: str | None = None) -> dict[str, Any]:
+        dashboard = self.get_school_dashboard(school_id)
+        date_value = business_date or dashboard["business_date"]
+        payload = {"business_date": date_value, "present_by_class": [
+            {"classroom": c["name"], "present": c["present_count"]} for c in dashboard["classrooms"]
+        ], "dietary_restrictions": dashboard["dietary_restrictions"]}
+        with self._connect() as conn:
+            recipients = [dict(r) for r in conn.execute(
+                "SELECT id,name,phone FROM kitchen_recipients WHERE school_id=? AND active=1", (school_id,)
+            )]
+            if not recipients:
+                raise ValueError("Nenhum destinatário da cozinha configurado")
+            cur = conn.execute(
+                """INSERT INTO kitchen_dispatches(school_id,business_date,payload_json,status,created_at)
+                   VALUES(?,?,?,'mocked',?) ON CONFLICT(school_id,business_date) DO NOTHING""",
+                (school_id, date_value, json.dumps(payload, ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+        return {"payload": payload, "recipients": recipients, "duplicate": cur.rowcount == 0}
+
+    def finish_kitchen_dispatch(self, school_id: int, business_date: str, success: bool) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE kitchen_dispatches SET status=?,attempts=attempts+1
+                   WHERE school_id=? AND business_date=?""",
+                ("sent" if success else "failed", school_id, business_date),
+            )
+            conn.commit()
+
+    def assign_face_to_school(self, face_id: str, school_id: int) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """UPDATE faces SET school_id = ?
+                   WHERE id = ? AND active = 1 AND (school_id IS NULL OR school_id = ?)""",
+                (school_id, face_id, school_id),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
+    def erase_student_personal_data(self, school_id: int, face_id: str) -> str | None:
+        """Anonymize PII/biometrics while preserving non-identifying attendance audit."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT photo_path FROM faces WHERE id=? AND school_id=?", (face_id, school_id)
+            ).fetchone()
+            if not row:
+                raise ValueError("Aluno não encontrado nesta escola")
+            conn.execute("DELETE FROM student_guardians WHERE face_id=?", (face_id,))
+            conn.execute("DELETE FROM classroom_students WHERE face_id=?", (face_id,))
+            conn.execute("DELETE FROM dietary_restrictions WHERE face_id=?", (face_id,))
+            conn.execute("DELETE FROM teacher_notes WHERE face_id=?", (face_id,))
+            conn.execute(
+                """UPDATE faces SET full_name='Titular removido',phone='',email='',notes='',
+                   photo_path=NULL,encoding_json=NULL,active=0 WHERE id=? AND school_id=?""",
+                (face_id, school_id),
+            )
+            conn.commit()
+            return row["photo_path"]
+
+    def enroll_student(self, school_id: int, classroom_id: int, face_id: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            valid = conn.execute(
+                """SELECT 1 FROM classrooms c JOIN faces f ON f.school_id = c.school_id
+                   WHERE c.id = ? AND c.school_id = ? AND f.id = ? AND c.active = 1 AND f.active = 1""",
+                (classroom_id, school_id, face_id),
+            ).fetchone()
+            if not valid:
+                raise ValueError("Turma ou aluno não pertence à escola")
+            conn.execute(
+                """INSERT INTO classroom_students (classroom_id, face_id, enrolled_at, active)
+                   VALUES (?, ?, ?, 1) ON CONFLICT(classroom_id, face_id)
+                   DO UPDATE SET active = 1, enrolled_at = excluded.enrolled_at""",
+                (classroom_id, face_id, now),
+            )
+            conn.commit()
+
+    def add_teacher_note(
+        self,
+        school_id: int,
+        member_id: int,
+        body: str,
+        face_id: str | None = None,
+        classroom_id: int | None = None,
+    ) -> int:
+        if not body.strip() or (not face_id and not classroom_id):
+            raise ValueError("Anotação e aluno ou turma são obrigatórios")
+        with self._connect() as conn:
+            member = conn.execute(
+                "SELECT 1 FROM school_members WHERE id = ? AND school_id = ? AND active = 1",
+                (member_id, school_id),
+            ).fetchone()
+            face_ok = not face_id or conn.execute(
+                "SELECT 1 FROM faces WHERE id = ? AND school_id = ? AND active = 1",
+                (face_id, school_id),
+            ).fetchone()
+            class_ok = not classroom_id or conn.execute(
+                "SELECT 1 FROM classrooms WHERE id = ? AND school_id = ? AND active = 1",
+                (classroom_id, school_id),
+            ).fetchone()
+            if not member or not face_ok or not class_ok:
+                raise ValueError("Membro, aluno ou turma não pertence à escola")
+            cursor = conn.execute(
+                """INSERT INTO teacher_notes
+                   (school_id, member_id, face_id, classroom_id, body, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    school_id,
+                    member_id,
+                    face_id,
+                    classroom_id,
+                    body.strip(),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def get_school_dashboard(self, school_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            school = conn.execute("SELECT timezone FROM schools WHERE id=?", (school_id,)).fetchone()
+            if not school:
+                raise ValueError("Escola não encontrada")
+            business_date = datetime.now(ZoneInfo(school["timezone"])).date().isoformat()
+            classrooms = [
+                dict(row)
+                for row in conn.execute(
+                    """SELECT c.id, c.name, c.school_year,
+                          COUNT(DISTINCT cs.face_id) AS student_count,
+                          COUNT(DISTINCT CASE WHEN da.status='presente' THEN cs.face_id END) AS present_count
+                   FROM classrooms c LEFT JOIN classroom_students cs
+                     ON cs.classroom_id = c.id AND cs.active = 1
+                   LEFT JOIN daily_attendance da ON da.face_id=cs.face_id AND da.attendance_date=?
+                   WHERE c.school_id = ? AND c.active = 1
+                   GROUP BY c.id ORDER BY c.name""",
+                    (business_date, school_id),
+                ).fetchall()
+            ]
+            totals = conn.execute(
+                """SELECT COUNT(*) AS students,
+                   SUM(CASE WHEN da.status = 'presente' THEN 1 ELSE 0 END) AS present_today
+                   FROM faces f LEFT JOIN daily_attendance da ON da.face_id = f.id
+                     AND da.attendance_date = ?
+                   WHERE f.school_id = ? AND f.active = 1""",
+                (business_date, school_id),
+            ).fetchone()
+            notes = [
+                dict(row)
+                for row in conn.execute(
+                    """SELECT n.id, n.body, n.face_id, n.classroom_id, n.created_at,
+                          m.full_name AS author_name
+                   FROM teacher_notes n JOIN school_members m ON m.id = n.member_id
+                   WHERE n.school_id = ? ORDER BY n.created_at DESC LIMIT 50""",
+                    (school_id,),
+                ).fetchall()
+            ]
+            restrictions = [dict(r) for r in conn.execute(
+                """SELECT dr.id,dr.face_id,f.full_name,dr.description,dr.severity
+                   FROM dietary_restrictions dr JOIN faces f ON f.id=dr.face_id
+                   WHERE dr.school_id=? AND dr.active=1 ORDER BY f.full_name""", (school_id,)
+            )]
+            last_update = conn.execute(
+                "SELECT MAX(event_at) FROM presence_events WHERE school_id=?", (school_id,)
+            ).fetchone()[0]
+        students = int(totals["students"] or 0)
+        present = int(totals["present_today"] or 0)
+        return {
+            "business_date": business_date,
+            "students": students,
+            "present_today": present,
+            "absent_today": max(0, students - present),
+            "classrooms": classrooms,
+            "notes": notes,
+            "dietary_restrictions": restrictions,
+            "last_updated_at": last_update,
+        }
+
+    def add_dietary_restriction(
+        self, school_id: int, face_id: str, description: str, severity: str = "atenção"
+    ) -> int:
+        if not description.strip():
+            raise ValueError("Descrição é obrigatória")
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO dietary_restrictions
+                   (school_id, face_id, description, severity, created_at) VALUES (?, ?, ?, ?, ?)""",
+                (school_id, face_id, description.strip(), severity, datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def create_device(self, school_id: int, device_id: str, name: str, secret: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO devices (id, school_id, name, secret_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+                (device_id, school_id, name, self.hash_secret(secret), datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+
+    def authenticate_device(self, device_id: str, secret: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT d.id, d.school_id, s.timezone FROM devices d JOIN schools s ON s.id=d.school_id
+                   WHERE d.id=? AND d.secret_hash=? AND d.active=1 AND s.active=1""",
+                (device_id, self.hash_secret(secret)),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def record_device_presence(
+        self, school_id: int, device_id: str, external_id: str, face_id: str,
+        event_at: str | None = None,
+    ) -> tuple[int, str, bool]:
+        now = event_at or datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT presence_event_id FROM device_events WHERE device_id=? AND external_id=?",
+                (device_id, external_id),
+            ).fetchone()
+            if existing:
+                event = conn.execute(
+                    "SELECT direction FROM presence_events WHERE id=?", (existing["presence_event_id"],)
+                ).fetchone()
+                return int(existing["presence_event_id"]), event["direction"], True
+            face = conn.execute(
+                "SELECT 1 FROM faces WHERE id=? AND school_id=? AND active=1", (face_id, school_id)
+            ).fetchone()
+            if not face:
+                raise ValueError("Aluno não pertence à escola do dispositivo")
+            local_date = self._parse_iso_datetime(now).astimezone(
+                ZoneInfo(conn.execute("SELECT timezone FROM schools WHERE id=?", (school_id,)).fetchone()[0])
+            ).date().isoformat()
+            # event_at is UTC; filter precisely using Python for non-UTC school timezones.
+            candidates = conn.execute(
+                """SELECT direction,event_at FROM presence_events WHERE face_id=? AND school_id=?
+                   ORDER BY event_at DESC LIMIT 100""", (face_id, school_id)
+            ).fetchall()
+            last_direction = next((r["direction"] for r in candidates if self._attendance_date_from_zone(r["event_at"], conn, school_id) == local_date), None)
+            direction = "saida" if last_direction == "entrada" else "entrada"
+            cur = conn.execute(
+                """INSERT INTO presence_events
+                   (face_id,direction,event_at,school_id,device_id,idempotency_key)
+                   VALUES (?,?,?,?,?,?)""", (face_id, direction, now, school_id, device_id, f"device:{device_id}:{external_id}"),
+            )
+            event_id = int(cur.lastrowid)
+            conn.execute(
+                "INSERT INTO device_events (device_id,external_id,face_id,presence_event_id,created_at) VALUES (?,?,?,?,?)",
+                (device_id, external_id, face_id, event_id, now),
+            )
+            self._upsert_daily_attendance(conn, face_id, direction, now, local_date)
+            self._enqueue_outbox(conn, school_id, f"presence:{event_id}", "presence", {
+                "event_id": event_id, "face_id": face_id, "direction": direction, "event_at": now,
+            })
+            conn.commit()
+            return event_id, direction, False
+
+    def _attendance_date_from_zone(self, event_at: str, conn: sqlite3.Connection, school_id: int) -> str:
+        zone = conn.execute("SELECT timezone FROM schools WHERE id=?", (school_id,)).fetchone()[0]
+        return self._parse_iso_datetime(event_at).astimezone(ZoneInfo(zone)).date().isoformat()
+
+    def _enqueue_outbox(
+        self, conn: sqlite3.Connection, school_id: int, key: str, aggregate: str, payload: dict[str, Any]
+    ) -> None:
+        conn.execute(
+            """INSERT OR IGNORE INTO sync_outbox
+               (school_id,event_key,aggregate_type,payload_json,created_at) VALUES (?,?,?,?,?)""",
+            (school_id, key, aggregate, json.dumps(payload), datetime.now(timezone.utc).isoformat()),
+        )
+
+    def pending_outbox(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM sync_outbox WHERE status='pending' ORDER BY id LIMIT ?", (limit,)
+            )]
+
+    def mark_outbox(self, item_id: int, success: bool, error: str = "") -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE sync_outbox SET status=?, attempts=attempts+1,last_error=?,processed_at=?
+                   WHERE id=?""",
+                ("sent" if success else "pending", error, datetime.now(timezone.utc).isoformat() if success else None, item_id),
+            )
+            conn.commit()
+
     def add_face(
         self,
         face_id: str,
@@ -275,6 +818,7 @@ class FaceDatabase:
         notes: str = "",
         photo_path: str | None = None,
         encoding: list[float] | None = None,
+        school_id: int | None = None,
     ) -> bool:
         try:
             with self._connect() as conn:
@@ -282,8 +826,8 @@ class FaceDatabase:
                     """
                     INSERT INTO faces (
                         id, full_name, phone, email, notes, photo_path,
-                        encoding_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        encoding_json, created_at, school_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         face_id,
@@ -294,6 +838,7 @@ class FaceDatabase:
                         photo_path,
                         json.dumps(encoding) if encoding is not None else None,
                         datetime.now(timezone.utc).isoformat(),
+                        school_id,
                     ),
                 )
                 conn.commit()
@@ -312,10 +857,11 @@ class FaceDatabase:
             data["notification_phone"] = recipient["phone"] if recipient else data.get("phone")
         return data
 
-    def list_faces(self) -> list[dict[str, Any]]:
+    def list_faces(self, school_id: int | None = None) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM faces WHERE active = 1 ORDER BY created_at DESC"
+                """SELECT * FROM faces WHERE active = 1 AND (? IS NULL OR school_id = ?)
+                   ORDER BY created_at DESC""", (school_id, school_id)
             ).fetchall()
         faces = [self._row_to_face(row) for row in rows]
         for face in faces:
@@ -325,7 +871,14 @@ class FaceDatabase:
 
     def update_face(self, face_id: str, **kwargs: Any) -> bool:
         allowed = {
-            "full_name", "phone", "email", "notes", "photo_path", "active", "encoding"
+            "full_name",
+            "phone",
+            "email",
+            "notes",
+            "photo_path",
+            "active",
+            "encoding",
+            "school_id",
         }
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
@@ -374,16 +927,19 @@ class FaceDatabase:
     ) -> int:
         event_at_value = event_at or datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
+            face = conn.execute("SELECT school_id FROM faces WHERE id=?", (face_id,)).fetchone()
+            school_id = face["school_id"] if face else None
             cursor = conn.execute(
                 """
-                INSERT INTO presence_events (face_id, direction, event_at, match_score)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO presence_events (face_id, direction, event_at, match_score, school_id)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     face_id,
                     direction,
                     event_at_value,
                     match_score,
+                    school_id,
                 ),
             )
             self._upsert_daily_attendance(
@@ -401,8 +957,9 @@ class FaceDatabase:
         face_id: str,
         direction: str,
         event_at: str,
+        attendance_date_override: str | None = None,
     ) -> None:
-        attendance_date = self._attendance_date_from_event(event_at)
+        attendance_date = attendance_date_override or self._attendance_date_from_event(event_at)
 
         row = conn.execute(
             """
@@ -545,17 +1102,18 @@ class FaceDatabase:
             )
             conn.commit()
 
-    def get_presence_events(self, limit: int = 50) -> list[dict[str, Any]]:
+    def get_presence_events(self, limit: int = 50, school_id: int | None = None) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT p.*, f.full_name, f.phone
                 FROM presence_events p
                 JOIN faces f ON p.face_id = f.id
+                WHERE (? IS NULL OR p.school_id = ?)
                 ORDER BY p.event_at DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (school_id, school_id, limit),
             ).fetchall()
         events = [dict(row) for row in rows]
         for event in events:
@@ -579,17 +1137,18 @@ class FaceDatabase:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_daily_attendance(self, limit: int = 100) -> list[dict[str, Any]]:
+    def get_daily_attendance(self, limit: int = 100, school_id: int | None = None) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT da.*, f.full_name, f.phone
                 FROM daily_attendance da
                 JOIN faces f ON da.face_id = f.id
+                WHERE (? IS NULL OR f.school_id = ?)
                 ORDER BY da.attendance_date DESC, da.face_id ASC
                 LIMIT ?
                 """,
-                (limit,),
+                (school_id, school_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
     def get_preferred_notification_recipient(

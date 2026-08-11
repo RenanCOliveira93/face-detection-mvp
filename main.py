@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 import os
 import tempfile
+from functools import wraps
 
 import cv2
 import face_recognition
@@ -19,6 +20,7 @@ from database import FaceDatabase
 from face_registry import FaceRegistry, slugify
 from integrations.webhook_client import publish_presence_event
 from messaging import send_whatsapp_message
+from recognition_pipeline import recognize_batch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +33,33 @@ db = FaceDatabase(attendance_timezone=CONFIG["attendance_timezone"])
 registry = FaceRegistry(db)
 
 _CORS_ORIGIN = os.getenv("CORS_ORIGIN", "*")
+
+
+def _principal():
+    api_key = request.headers.get("X-School-Key", "").strip()
+    if not api_key:
+        return None
+    member = db.authenticate_principal(api_key)
+    if member:
+        return member
+    school = db.get_school_by_api_key(api_key)
+    if school:
+        return {"school_id": school["id"], "role": "integration", "timezone": school["timezone"]}
+    return None
+
+
+def require_roles(*roles):
+    def decorator(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            principal = _principal()
+            if not principal:
+                return jsonify({"error": "Credencial ausente ou inválida"}), 401
+            if principal["role"] not in roles:
+                return jsonify({"error": "Papel sem permissão para este recurso"}), 403
+            return view(*args, principal=principal, **kwargs)
+        return wrapped
+    return decorator
 
 
 @app.after_request
@@ -215,8 +244,9 @@ def generate_frames():
             locations = face_recognition.face_locations(small, model="hog")
             encodings = face_recognition.face_encodings(small, locations)
 
-            for encoding, location in zip(encodings, locations):
-                person, match_score = registry.match_encoding(encoding)
+            matches = recognize_batch(encodings, registry.match_encoding)
+            for match, location in zip(matches, locations):
+                person, match_score = match["person"], match["match_score"]
                 top, right, bottom, left = [int(v / scale) for v in location]
                 current_faces.append(
                     {
@@ -300,7 +330,7 @@ def _handle_recognized(person: dict, match_score: float | None):
 
 @app.route("/")
 def index():
-    return render_template("index.html", faces=db.list_faces(), config=CONFIG)
+    return render_template("index.html", faces=[], config=CONFIG)
 
 
 @app.route("/video_feed")
@@ -309,47 +339,60 @@ def video_feed():
 
 
 @app.route("/api/status")
-def api_status():
+@require_roles("school_admin", "professor", "integration")
+def api_status(principal):
     with state_lock:
         return jsonify(
             {
                 "status": state["status"],
-                "person": state["latest_person"],
+                "person": state["latest_person"] if (state["latest_person"] or {}).get("school_id") == principal["school_id"] else None,
                 "message_sent": state["last_message_sent"],
                 "message_info": state["last_message_info"],
                 "match_score": state["latest_match_score"],
-                "registered_faces": len(registry.known_faces()),
+                "registered_faces": len(db.list_faces(school_id=principal["school_id"])),
                 "last_event_direction": state["last_event_direction"],
                 "last_event_at": state["last_event_at"],
-                "active_tracks": len(active_presence_tracks),
-                "recent_people": list(state["recent_people"].values())[-10:],
+                "active_tracks": sum(
+                    1 for track in active_presence_tracks.values()
+                    if track["person"].get("school_id") == principal["school_id"]
+                ),
+                "recent_people": [
+                    item for face_id, item in state["recent_people"].items()
+                    if (db.get_face(face_id) or {}).get("school_id") == principal["school_id"]
+                ][-10:],
             }
         )
 
 
 @app.route("/api/presence_events")
-def api_presence_events():
+@require_roles("school_admin", "professor", "integration")
+def api_presence_events(principal):
     return jsonify(
         {
-            "active_tracks": len(active_presence_tracks),
-            "events": db.get_presence_events(limit=20),
+            "active_tracks": sum(
+                1 for track in active_presence_tracks.values()
+                if track["person"].get("school_id") == principal["school_id"]
+            ),
+            "events": db.get_presence_events(limit=20, school_id=principal["school_id"]),
         }
     )
 
 
 @app.route("/api/daily_attendance")
-def api_daily_attendance():
+@require_roles("school_admin", "professor", "integration")
+def api_daily_attendance(principal):
     return jsonify(
         {
             "timezone": CONFIG["attendance_timezone"],
-            "items": db.get_daily_attendance(limit=200),
+            "items": db.get_daily_attendance(limit=200, school_id=principal["school_id"]),
         }
     )
 
 
 @app.route("/api/faces")
-def api_faces():
-    faces = db.list_faces()
+@require_roles("school_admin", "professor", "integration")
+def api_faces(principal):
+    faces = db.list_faces(school_id=principal["school_id"])
     result = []
     for f in faces:
         result.append({
@@ -368,7 +411,8 @@ def api_faces():
 
 
 @app.route("/api/register", methods=["POST", "OPTIONS"])
-def api_register():
+@require_roles("school_admin", "integration")
+def api_register(principal):
     if request.method == "OPTIONS":
         return "", 204
 
@@ -409,6 +453,10 @@ def api_register():
             student = db.get_face(person_id)
 
         # Recarrega known_faces para reconhecimento imediato
+        if student:
+            if not db.assign_face_to_school(student["id"], principal["school_id"]):
+                return jsonify({"success": False, "error": "Aluno já pertence a outra escola"}), 409
+            student = db.get_face(student["id"])
         registry.known_faces()
 
         return jsonify({"success": True, "student": student})
@@ -420,6 +468,182 @@ def api_register():
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+@app.route("/api/schools", methods=["POST"])
+def api_create_school():
+    token = CONFIG.get("admin_bootstrap_token")
+    if not token or request.headers.get("X-Bootstrap-Token") != token:
+        return jsonify({"error": "Bootstrap não autorizado"}), 401
+    payload = request.get_json(silent=True) or {}
+    if not payload.get("name") or not payload.get("slug"):
+        return jsonify({"error": "name e slug são obrigatórios"}), 400
+    try:
+        school = db.create_school(
+            payload["name"], payload["slug"], timezone_name=payload.get("timezone", "UTC")
+        )
+        admin = None
+        if payload.get("admin_name") and payload.get("admin_email"):
+            admin = db.add_school_member(
+                school["id"], payload["admin_name"], payload["admin_email"], "school_admin"
+            )
+        return jsonify({"school": school, "admin": admin}), 201
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 409
+
+
+@app.route("/api/school/dashboard")
+@require_roles("school_admin", "professor", "integration")
+def api_school_dashboard(principal):
+    return jsonify(db.get_school_dashboard(principal["school_id"]))
+
+
+@app.route("/api/school/members", methods=["GET", "POST"])
+@require_roles("school_admin")
+def api_school_members(principal):
+    if request.method == "GET":
+        return jsonify({"items": db.list_school_members(principal["school_id"])})
+    payload = request.get_json(silent=True) or {}
+    try:
+        member = db.add_school_member(
+            principal["school_id"],
+            payload.get("full_name", ""),
+            payload.get("email", ""),
+            payload.get("role", "professor"),
+        )
+        return jsonify(member), 201
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/school/classrooms", methods=["POST"])
+@app.route("/api/classes", methods=["POST"])
+@require_roles("school_admin")
+def api_school_classrooms(principal):
+    payload = request.get_json(silent=True) or {}
+    if not payload.get("name"):
+        return jsonify({"error": "name é obrigatório"}), 400
+    try:
+        classroom_id = db.create_classroom(
+            principal["school_id"], payload["name"], payload.get("school_year", "")
+        )
+        return jsonify({"id": classroom_id}), 201
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 409
+
+
+@app.route("/api/school/students/<face_id>/assign", methods=["POST"])
+@require_roles("school_admin")
+def api_assign_student(face_id: str, principal):
+    if not db.assign_face_to_school(face_id, principal["school_id"]):
+        return jsonify({"error": "Aluno não encontrado"}), 404
+    return jsonify({"success": True})
+
+
+@app.route("/api/school/students/<face_id>", methods=["DELETE"])
+@require_roles("school_admin")
+def api_erase_student(face_id: str, principal):
+    try:
+        photo_path = db.erase_student_personal_data(principal["school_id"], face_id)
+        if photo_path and os.path.isfile(photo_path):
+            os.unlink(photo_path)
+        registry.known_faces()
+        return "", 204
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 404
+
+
+@app.route("/api/school/classrooms/<int:classroom_id>/students", methods=["POST"])
+@require_roles("school_admin")
+def api_enroll_student(classroom_id: int, principal):
+    payload = request.get_json(silent=True) or {}
+    try:
+        db.enroll_student(principal["school_id"], classroom_id, payload.get("face_id", ""))
+        return jsonify({"success": True}), 201
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/school/notes", methods=["POST"])
+@require_roles("school_admin", "professor")
+def api_teacher_notes(principal):
+    payload = request.get_json(silent=True) or {}
+    try:
+        note_id = db.add_teacher_note(
+            principal["school_id"], principal.get("member_id", 0), payload.get("body", ""),
+            face_id=payload.get("face_id"), classroom_id=payload.get("classroom_id"),
+        )
+        return jsonify({"id": note_id}), 201
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/dietary-restrictions", methods=["POST"])
+@require_roles("school_admin")
+def api_dietary_restrictions(principal):
+    payload = request.get_json(silent=True) or {}
+    try:
+        item_id = db.add_dietary_restriction(
+            principal["school_id"], payload.get("face_id", ""),
+            payload.get("description", ""), payload.get("severity", "atenção"),
+        )
+        return jsonify({"id": item_id}), 201
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/kitchen/recipients", methods=["POST"])
+@require_roles("school_admin")
+def api_kitchen_recipient(principal):
+    payload = request.get_json(silent=True) or {}
+    try:
+        item_id = db.add_kitchen_recipient(
+            principal["school_id"], payload.get("name", ""), payload.get("phone", "")
+        )
+        return jsonify({"id": item_id}), 201
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/kitchen/dispatch", methods=["POST"])
+@require_roles("school_admin")
+def api_kitchen_dispatch(principal):
+    payload = request.get_json(silent=True) or {}
+    try:
+        dispatch = db.prepare_kitchen_dispatch(principal["school_id"], payload.get("date"))
+        if dispatch["duplicate"]:
+            return jsonify({**dispatch, "message_results": []})
+        summary = dispatch["payload"]
+        message = "Cozinha escolar - " + summary["business_date"] + ": " + "; ".join(
+            f"{item['classroom']}={item['present']} presentes" for item in summary["present_by_class"]
+        )
+        results = [send_whatsapp_message(item["phone"], message)[0] for item in dispatch["recipients"]]
+        success = bool(results) and all(results)
+        db.finish_kitchen_dispatch(principal["school_id"], summary["business_date"], success)
+        return jsonify({**dispatch, "message_results": results})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/new_user_identified.fcgi", methods=["POST"])
+def control_id_callback():
+    device_id = request.headers.get("X-Device-Id", "")
+    device_secret = request.headers.get("X-Device-Secret", "")
+    device = db.authenticate_device(device_id, device_secret)
+    if not device:
+        return jsonify({"error": "Dispositivo não autorizado"}), 401
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    external_id = str(payload.get("event_id", "")).strip()
+    face_id = str(payload.get("user_id", "")).strip()
+    if not external_id or not face_id:
+        return jsonify({"error": "event_id e user_id são obrigatórios"}), 400
+    try:
+        event_id, direction, duplicate = db.record_device_presence(
+            device["school_id"], device_id, external_id, face_id, payload.get("event_at")
+        )
+        return jsonify({"access": "granted", "event_id": event_id, "direction": direction, "duplicate": duplicate})
+    except ValueError as exc:
+        return jsonify({"access": "denied", "error": str(exc)}), 403
 
 
 if __name__ == "__main__":

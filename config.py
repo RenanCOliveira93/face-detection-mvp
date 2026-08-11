@@ -37,4 +37,6 @@ CONFIG = {
     "webhook_secret": os.getenv("WEBHOOK_SECRET", "").strip(),
     "webhook_timeout_seconds": float(os.getenv("WEBHOOK_TIMEOUT_SECONDS", 1.5)),
     "webhook_retry_max": int(os.getenv("WEBHOOK_RETRY_MAX", 2)),
+    "admin_bootstrap_token": os.getenv("ADMIN_BOOTSTRAP_TOKEN", "").strip(),
+    "postgres_dsn": os.getenv("POSTGRES_DSN", "").strip(),
 }
