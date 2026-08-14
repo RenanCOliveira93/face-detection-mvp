@@ -440,12 +440,21 @@ def api_register(principal):
                 face_id=custom_id,
                 email=email,
                 notes=notes,
+                school_id=principal["school_id"],
             )
         else:
             # Cadastro sem foto — aluno não será reconhecido até foto ser adicionada
             person_id = custom_id or slugify(name)
             existing = db.get_face(person_id)
-            payload = dict(full_name=name, phone=phone, email=email, notes=notes)
+            if (
+                existing
+                and existing.get("school_id") not in (None, principal["school_id"])
+            ):
+                return jsonify({"success": False, "error": "Aluno já pertence a outra escola"}), 409
+            payload = dict(
+                full_name=name, phone=phone, email=email, notes=notes,
+                school_id=principal["school_id"],
+            )
             if existing:
                 db.update_face(person_id, **payload)
             else:

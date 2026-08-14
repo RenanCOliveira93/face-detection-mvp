@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-DB_PATH = "database/faces.db"
+DB_PATH = os.getenv("DB_PATH", "database/faces.db")
 
 
 class FaceDatabase:

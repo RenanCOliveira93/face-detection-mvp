@@ -34,6 +34,7 @@ def register_from_args(args: argparse.Namespace) -> None:
         face_id=args.id,
         email=args.email,
         notes=args.notes,
+        school_id=args.school_id,
     )
     print(f"✅ Aluno salvo: {student['full_name']} ({student['id']})")
 
@@ -46,6 +47,7 @@ if __name__ == "__main__":
     parser.add_argument("--image", help="Caminho da foto do aluno")
     parser.add_argument("--email", default="", help="E-mail")
     parser.add_argument("--notes", default="", help="Observações")
+    parser.add_argument("--school-id", type=int, help="ID da escola proprietária do cadastro")
     args = parser.parse_args()
 
     if args.name and args.phone and args.image:

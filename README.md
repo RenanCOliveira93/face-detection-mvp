@@ -60,6 +60,36 @@ curl -X POST localhost:5000/api/kitchen/recipients -H "X-School-Key: $SCHOOL_KEY
 curl -X POST localhost:5000/api/kitchen/dispatch -H "X-School-Key: $SCHOOL_KEY" -H 'Content-Type: application/json' -d '{}'
 ```
 
+## Cenário mock com as fotos locais existentes
+
+`storage/` é ignorado pelo Git por conter biometria. Portanto, copie ou mantenha as
+fotos autorizadas apenas na sua máquina, em `storage/faces`. Cada arquivo deve ter
+um único rosto e extensão JPG, JPEG, PNG, BMP ou WEBP. Em seguida:
+
+```bash
+python scripts/seed_mock_school.py
+export DB_PATH=database/mock_school.db
+python main.py
+```
+
+O seed cria uma escola, dois perfis, duas turmas, alunos fictícios (um por foto),
+matrículas, uma restrição fictícia, uma anotação, cozinha e dispositivo Control iD
+mock. As chaves ficam apenas em `database/mock_school_manifest.json`, também ignorado.
+Ele não altera nem duplica as fotos. Para evitar apagar dados por engano, recusa-se
+a sobrescrever um banco já existente.
+
+Teste as APIs com a `admin_key` do manifesto:
+
+```bash
+curl localhost:5000/api/school/dashboard -H "X-School-Key: $SCHOOL_KEY"
+curl localhost:5000/api/faces -H "X-School-Key: $SCHOOL_KEY"
+```
+
+Para simular presença sem câmera, use o `device_id`, `device_secret` e um ID de aluno
+do manifesto em `/new_user_identified.fcgi`. Envie outro `event_id` para alternar
+entrada/saída; repita o mesmo `event_id` para validar idempotência. Depois valide o
+dashboard e o dispatch da cozinha em modo `MOCK_MESSAGES=true`.
+
 ## Control iD seguro
 
 Cadastre o dispositivo por uma rotina administrativa usando `FaceDatabase.create_device`. O callback exige identidade e segredo do dispositivo, `event_id` único (anti-replay/idempotência) e aluno da mesma escola:
