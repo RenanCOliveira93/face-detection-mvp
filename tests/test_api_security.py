@@ -81,6 +81,19 @@ class ApiSecurityTests(unittest.TestCase):
         self.assertFalse(first.get_json()["duplicate"])
         self.assertTrue(duplicate.get_json()["duplicate"])
 
+    def test_registration_cannot_take_student_from_another_school(self) -> None:
+        other = main.db.create_school("Escola B", "escola-b", "school-b")
+        main.db.add_face("shared-id", "Aluno B", "", school_id=other["id"])
+
+        response = self.client.post(
+            "/api/register",
+            headers={"X-School-Key": self.admin_key},
+            data={"id": "shared-id", "name": "Tentativa", "phone": "+5511900000000"},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(main.db.get_face("shared-id")["school_id"], other["id"])
+
 
 if __name__ == "__main__":
     unittest.main()
