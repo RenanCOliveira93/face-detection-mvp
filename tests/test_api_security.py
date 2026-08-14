@@ -94,6 +94,25 @@ class ApiSecurityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(main.db.get_face("shared-id")["school_id"], other["id"])
 
+    def test_attendance_book_requires_auth_and_includes_absent_students(self) -> None:
+        main.db.add_face("present", "Aluno Presente", "", school_id=self.school["id"])
+        main.db.add_face("absent", "Aluno Ausente", "", school_id=self.school["id"])
+        classroom = main.db.create_classroom(self.school["id"], "1 A", "2026")
+        main.db.enroll_student(self.school["id"], classroom, "present")
+        main.db.enroll_student(self.school["id"], classroom, "absent")
+        main.db.create_presence_event("present", "entrada", 0.9, "2026-08-13T12:00:00+00:00")
+
+        self.assertEqual(self.client.get("/api/attendance-book").status_code, 401)
+        response = self.client.get(
+            "/api/attendance-book?date=2026-08-13",
+            headers={"X-School-Key": self.admin_key},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["total_students"], 2)
+        self.assertEqual({item["status"] for item in payload["items"]}, {"presente", "ausente"})
+
 
 if __name__ == "__main__":
     unittest.main()
