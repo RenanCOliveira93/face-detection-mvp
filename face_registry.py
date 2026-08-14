@@ -37,6 +37,8 @@ class FaceRegistry:
         face_id: str | None = None,
         email: str = "",
         notes: str = "",
+        school_id: int | None = None,
+        store_image: bool = True,
     ) -> dict:
         person_id = face_id or slugify(full_name)
         image_src = Path(image_path)
@@ -47,9 +49,21 @@ class FaceRegistry:
 
         encoding = extract_face_encoding(image_src)
         stored_path = self.images_dir / f"{person_id}{image_src.suffix.lower()}"
-        shutil.copy2(image_src, stored_path)
+        if store_image:
+            # A foto pode já estar no diretório de armazenamento (por exemplo,
+            # durante o seed local). Evite SameFileError e cópias redundantes.
+            if image_src.resolve() != stored_path.resolve():
+                shutil.copy2(image_src, stored_path)
+        else:
+            stored_path = image_src.resolve()
 
         existing = self.db.get_face(person_id)
+        if (
+            existing
+            and school_id is not None
+            and existing.get("school_id") not in (None, school_id)
+        ):
+            raise ValueError("Aluno já pertence a outra escola.")
         payload = {
             "full_name": full_name,
             "phone": phone,
@@ -58,6 +72,8 @@ class FaceRegistry:
             "photo_path": str(stored_path),
             "encoding": encoding.tolist(),
         }
+        if school_id is not None:
+            payload["school_id"] = school_id
         if existing:
             self.db.update_face(person_id, **payload)
         else:
