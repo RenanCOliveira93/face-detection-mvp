@@ -1151,6 +1151,54 @@ class FaceDatabase:
                 (school_id, school_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_attendance_book(
+        self, school_id: int, attendance_date: str | None = None
+    ) -> dict[str, Any]:
+        """Return the complete active roster, including students without events."""
+        with self._connect() as conn:
+            school = conn.execute(
+                "SELECT timezone FROM schools WHERE id=? AND active=1", (school_id,)
+            ).fetchone()
+            if not school:
+                raise ValueError("Escola não encontrada")
+            date_value = attendance_date or datetime.now(
+                ZoneInfo(school["timezone"])
+            ).date().isoformat()
+            try:
+                datetime.strptime(date_value, "%Y-%m-%d")
+            except ValueError as exc:
+                raise ValueError("Data deve usar o formato YYYY-MM-DD") from exc
+            rows = [dict(row) for row in conn.execute(
+                """
+                SELECT f.id AS face_id, f.full_name,
+                       c.id AS classroom_id, c.name AS classroom_name,
+                       da.first_entry_at, da.last_exit_at,
+                       COALESCE(da.status, 'ausente') AS status,
+                       COALESCE(da.total_transitions, 0) AS total_transitions
+                FROM faces f
+                LEFT JOIN classroom_students cs
+                  ON cs.face_id=f.id AND cs.active=1
+                LEFT JOIN classrooms c
+                  ON c.id=cs.classroom_id AND c.school_id=f.school_id AND c.active=1
+                LEFT JOIN daily_attendance da
+                  ON da.face_id=f.id AND da.attendance_date=?
+                WHERE f.school_id=? AND f.active=1
+                ORDER BY COALESCE(c.name, ''), f.full_name
+                """,
+                (date_value, school_id),
+            )]
+        present = sum(item["status"] == "presente" for item in rows)
+        inconsistent = sum(item["status"] == "inconsistente" for item in rows)
+        return {
+            "date": date_value,
+            "timezone": school["timezone"],
+            "total_students": len(rows),
+            "present": present,
+            "absent": sum(item["status"] == "ausente" for item in rows),
+            "inconsistent": inconsistent,
+            "items": rows,
+        }
     def get_preferred_notification_recipient(
         self,
         face_id: str,
