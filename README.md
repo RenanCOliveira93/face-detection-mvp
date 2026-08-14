@@ -56,8 +56,8 @@ DEFAULT_RECIPIENT=
 ## Instalação
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .teya_venv
+source .teya_venv/bin/activate
 pip install -r requirements.txt
 ```
 
