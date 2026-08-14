@@ -65,7 +65,7 @@ def require_roles(*roles):
 @app.after_request
 def _add_cors(response):
     response.headers["Access-Control-Allow-Origin"] = _CORS_ORIGIN
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-School-Key"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return response
 
@@ -387,6 +387,16 @@ def api_daily_attendance(principal):
             "items": db.get_daily_attendance(limit=200, school_id=principal["school_id"]),
         }
     )
+
+
+@app.route("/api/attendance-book")
+@require_roles("school_admin", "professor", "integration")
+def api_attendance_book(principal):
+    attendance_date = request.args.get("date", "").strip() or None
+    try:
+        return jsonify(db.get_attendance_book(principal["school_id"], attendance_date))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/api/faces")
