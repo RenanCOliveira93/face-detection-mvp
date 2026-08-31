@@ -5,7 +5,7 @@ import unittest
 import sys
 import importlib.util
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 if importlib.util.find_spec("flask") is None:
     raise unittest.SkipTest("Flask não instalado neste ambiente")
@@ -112,6 +112,62 @@ class ApiSecurityTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["total_students"], 2)
         self.assertEqual({item["status"] for item in payload["items"]}, {"presente", "ausente"})
+
+    def test_video_feed_requires_school_key_via_header_or_query_param(self) -> None:
+        self.assertEqual(self.client.get("/video_feed").status_code, 401)
+        self.assertEqual(self.client.get("/video_feed?key=invalid").status_code, 401)
+
+        # A rota abre a câmera de verdade quando autorizada; o corpo streaming não
+        # importa aqui, só a checagem de credencial feita antes de gerar frames.
+        empty_capture = MagicMock()
+        empty_capture.read.return_value = (False, None)
+        with patch("main.cv2.VideoCapture", return_value=empty_capture):
+            self.assertEqual(
+                self.client.get("/video_feed", headers={"X-School-Key": "prof-key"}).status_code, 200
+            )
+            self.assertEqual(
+                self.client.get(f"/video_feed?key={self.admin_key}").status_code, 200
+            )
+
+    def test_login_establishes_session_that_authenticates_subsequent_requests(self) -> None:
+        self.assertEqual(self.client.post("/api/auth/login", json={"api_key": "invalid"}).status_code, 401)
+        self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+
+        login = self.client.post("/api/auth/login", json={"api_key": "prof-key"})
+        self.assertEqual(login.status_code, 200)
+        self.assertEqual(login.get_json()["role"], "professor")
+
+        # Sem enviar X-School-Key: a sessão (cookie) já autentica.
+        me = self.client.get("/api/auth/me")
+        self.assertEqual(me.status_code, 200)
+        self.assertEqual(me.get_json()["role"], "professor")
+
+        events = self.client.get("/api/presence_events")
+        self.assertEqual(events.status_code, 200)
+
+        self.assertEqual(self.client.post("/api/auth/logout").status_code, 204)
+        self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+        self.assertEqual(self.client.get("/api/presence_events").status_code, 401)
+
+    def test_session_takes_priority_but_header_still_works_without_login(self) -> None:
+        # Fluxo programático/dispositivo continua funcionando sem nenhuma sessão aberta.
+        response = self.client.get("/api/presence_events", headers={"X-School-Key": self.admin_key})
+        self.assertEqual(response.status_code, 200)
+
+    def test_control_id_callback_publishes_webhook_only_for_new_events(self) -> None:
+        main.db.add_face("student", "Aluno", "", school_id=self.school["id"])
+        main.db.create_device(self.school["id"], "gate", "Portaria", "secret")
+        headers = {"X-Device-Id": "gate", "X-Device-Secret": "secret"}
+        payload = {"event_id": "evt-1", "user_id": "student", "event_at": "2026-08-11T12:00:00+00:00"}
+
+        with patch("main.publish_presence_event") as mock_publish:
+            mock_publish.return_value = {"ok": True, "status": 200, "info": "ok", "sent_at": "now"}
+            first = self.client.post("/new_user_identified.fcgi", headers=headers, json=payload)
+            duplicate = self.client.post("/new_user_identified.fcgi", headers=headers, json=payload)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(duplicate.get_json()["duplicate"])
+        self.assertEqual(mock_publish.call_count, 1)
 
 
 if __name__ == "__main__":

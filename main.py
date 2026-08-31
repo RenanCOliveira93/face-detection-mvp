@@ -13,7 +13,7 @@ from functools import wraps
 
 import cv2
 import face_recognition
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, session
 
 from config import CONFIG
 from database import FaceDatabase
@@ -29,14 +29,40 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.secret_key = CONFIG["session_secret"]
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=CONFIG["session_cookie_secure"],
+    SESSION_COOKIE_SAMESITE=CONFIG["session_cookie_samesite"],
+)
 db = FaceDatabase(attendance_timezone=CONFIG["attendance_timezone"])
 registry = FaceRegistry(db)
 
-_CORS_ORIGIN = os.getenv("CORS_ORIGIN", "*")
+# Suporta tanto a variável legada CORS_ORIGIN (uma origem) quanto CORS_ORIGINS
+# (lista separada por vírgula, via config.py). Com sessão/cookie de login, o
+# navegador exige uma origem explícita — "*" nunca funciona com credentials.
+_CORS_ALLOWED_ORIGINS = set(CONFIG["cors_origins"])
+_legacy_origin = os.getenv("CORS_ORIGIN", "").strip()
+if _legacy_origin and _legacy_origin != "*":
+    _CORS_ALLOWED_ORIGINS.add(_legacy_origin)
+if not _CORS_ALLOWED_ORIGINS or os.getenv("CORS_ORIGIN", "").strip() == "*":
+    logger.warning(
+        "CORS_ORIGIN=* ou nenhuma origem configurada: login por sessão/cookie não "
+        "funcionará entre origens diferentes. Configure CORS_ORIGINS com a origem "
+        "real da interface (ex.: http://localhost:8080)."
+    )
 
 
 def _principal():
-    api_key = request.headers.get("X-School-Key", "").strip()
+    # 1) Sessão de login real (cookie httpOnly) — fluxo da interface web humana.
+    stored = session.get("principal")
+    if stored:
+        return stored
+    # 2) X-School-Key/dispositivo/integração — fluxo programático (curl, Control iD,
+    #    kiosk sem usuário logado). /video_feed é consumido por uma tag <img>, que não
+    #    envia headers customizados, então aceitamos a chave também via query string
+    #    apenas para esse fluxo de imagem.
+    api_key = request.headers.get("X-School-Key", "").strip() or request.args.get("key", "").strip()
     if not api_key:
         return None
     member = db.authenticate_principal(api_key)
@@ -64,10 +90,43 @@ def require_roles(*roles):
 
 @app.after_request
 def _add_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = _CORS_ORIGIN
+    origin = request.headers.get("Origin", "")
+    if origin in _CORS_ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    elif not _CORS_ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-School-Key"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return response
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_auth_login():
+    payload = request.get_json(silent=True) or {}
+    api_key = payload.get("api_key", "").strip()
+    if not api_key:
+        return jsonify({"error": "api_key é obrigatório"}), 400
+    principal = db.authenticate_principal(api_key)
+    if not principal:
+        return jsonify({"error": "Credencial inválida"}), 401
+    session["principal"] = principal
+    session.permanent = True
+    return jsonify(principal)
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def api_auth_logout():
+    session.clear()
+    return "", 204
+
+
+@app.route("/api/auth/me")
+def api_auth_me():
+    principal = session.get("principal")
+    if not principal:
+        return jsonify({"error": "Não autenticado"}), 401
+    return jsonify(principal)
 
 PRESENCE_EXIT_TIMEOUT_SECONDS = 8
 MAX_LIVE_EVENTS = 200
@@ -334,7 +393,8 @@ def index():
 
 
 @app.route("/video_feed")
-def video_feed():
+@require_roles("school_admin", "professor", "integration")
+def video_feed(principal):
     return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -535,10 +595,14 @@ def api_school_members(principal):
         return jsonify({"error": str(exc)}), 400
 
 
-@app.route("/api/school/classrooms", methods=["POST"])
-@app.route("/api/classes", methods=["POST"])
-@require_roles("school_admin")
+@app.route("/api/school/classrooms", methods=["GET", "POST"])
+@app.route("/api/classes", methods=["GET", "POST"])
+@require_roles("school_admin", "professor")
 def api_school_classrooms(principal):
+    if request.method == "GET":
+        return jsonify({"items": db.list_classrooms(principal["school_id"])})
+    if principal["role"] != "school_admin":
+        return jsonify({"error": "Papel sem permissão para este recurso"}), 403
     payload = request.get_json(silent=True) or {}
     if not payload.get("name"):
         return jsonify({"error": "name é obrigatório"}), 400
@@ -549,6 +613,25 @@ def api_school_classrooms(principal):
         return jsonify({"id": classroom_id}), 201
     except Exception as exc:
         return jsonify({"error": str(exc)}), 409
+
+
+@app.route("/api/school/classrooms/<int:classroom_id>", methods=["PUT", "DELETE"])
+@require_roles("school_admin")
+def api_update_classroom(classroom_id: int, principal):
+    if request.method == "DELETE":
+        try:
+            db.deactivate_classroom(principal["school_id"], classroom_id)
+            return "", 204
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+    payload = request.get_json(silent=True) or {}
+    try:
+        db.update_classroom(
+            principal["school_id"], classroom_id, payload.get("name", ""), payload.get("school_year", "")
+        )
+        return jsonify({"success": True})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.route("/api/school/students/<face_id>/assign", methods=["POST"])
@@ -572,9 +655,16 @@ def api_erase_student(face_id: str, principal):
         return jsonify({"error": str(exc)}), 404
 
 
-@app.route("/api/school/classrooms/<int:classroom_id>/students", methods=["POST"])
-@require_roles("school_admin")
+@app.route("/api/school/classrooms/<int:classroom_id>/students", methods=["GET", "POST"])
+@require_roles("school_admin", "professor")
 def api_enroll_student(classroom_id: int, principal):
+    if request.method == "GET":
+        try:
+            return jsonify({"items": db.list_classroom_students(principal["school_id"], classroom_id)})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+    if principal["role"] != "school_admin":
+        return jsonify({"error": "Papel sem permissão para este recurso"}), 403
     payload = request.get_json(silent=True) or {}
     try:
         db.enroll_student(principal["school_id"], classroom_id, payload.get("face_id", ""))
@@ -594,6 +684,220 @@ def api_teacher_notes(principal):
         )
         return jsonify({"id": note_id}), 201
     except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+def _forbidden_unless_assigned(principal, school_id: int, classroom_id: int, subject_id: int):
+    """Admin pode tudo; professor só atua em turma+disciplina onde está alocado."""
+    if principal["role"] == "school_admin":
+        return None
+    member_id = principal.get("member_id")
+    if not member_id or not db.is_teacher_assigned(school_id, member_id, classroom_id, subject_id):
+        return jsonify({"error": "Professor não está alocado nesta turma/disciplina"}), 403
+    return None
+
+
+def _forbidden_unless_lesson_owner(principal, lesson: dict):
+    if principal["role"] == "school_admin":
+        return None
+    if lesson["teacher_member_id"] != principal.get("member_id"):
+        return jsonify({"error": "Aula pertence a outro professor"}), 403
+    return None
+
+
+@app.route("/api/subjects", methods=["GET", "POST"])
+@require_roles("school_admin", "professor")
+def api_subjects(principal):
+    if request.method == "GET":
+        return jsonify({"items": db.list_subjects(principal["school_id"])})
+    if principal["role"] != "school_admin":
+        return jsonify({"error": "Papel sem permissão para este recurso"}), 403
+    payload = request.get_json(silent=True) or {}
+    try:
+        subject = db.create_subject(principal["school_id"], payload.get("name", ""))
+        return jsonify(subject), 201
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/subjects/<int:subject_id>", methods=["PUT", "DELETE"])
+@require_roles("school_admin")
+def api_update_subject(subject_id: int, principal):
+    if request.method == "DELETE":
+        try:
+            db.deactivate_subject(principal["school_id"], subject_id)
+            return "", 204
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+    payload = request.get_json(silent=True) or {}
+    try:
+        db.update_subject(principal["school_id"], subject_id, payload.get("name", ""))
+        return jsonify({"success": True})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/report-card", methods=["GET"])
+@require_roles("school_admin", "professor")
+def api_report_card(principal):
+    classroom_id = request.args.get("classroom_id", type=int)
+    face_id = request.args.get("face_id")
+    if not classroom_id:
+        return jsonify({"error": "classroom_id é obrigatório"}), 400
+    try:
+        return jsonify({"items": db.get_report_card(principal["school_id"], classroom_id, face_id)})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 404
+
+
+@app.route("/api/school/teacher-assignments", methods=["GET", "POST"])
+@require_roles("school_admin", "professor")
+def api_teacher_assignments(principal):
+    if request.method == "GET":
+        member_id = request.args.get("member_id", type=int) if principal["role"] == "school_admin" else principal.get("member_id")
+        return jsonify({"items": db.list_teacher_assignments(principal["school_id"], member_id)})
+    if principal["role"] != "school_admin":
+        return jsonify({"error": "Papel sem permissão para este recurso"}), 403
+    payload = request.get_json(silent=True) or {}
+    try:
+        assignment = db.create_teacher_assignment(
+            principal["school_id"], payload.get("member_id"),
+            payload.get("classroom_id"), payload.get("subject_id"),
+        )
+        return jsonify(assignment), 201
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/lessons", methods=["POST"])
+@require_roles("school_admin", "professor")
+def api_open_lesson(principal):
+    payload = request.get_json(silent=True) or {}
+    classroom_id = payload.get("classroom_id")
+    subject_id = payload.get("subject_id")
+    lesson_date = payload.get("lesson_date", "").strip()
+    teacher_member_id = principal.get("member_id") if principal["role"] == "professor" else payload.get("teacher_member_id")
+    if not lesson_date:
+        return jsonify({"error": "lesson_date é obrigatório (YYYY-MM-DD)"}), 400
+    if not teacher_member_id:
+        return jsonify({"error": "teacher_member_id é obrigatório"}), 400
+    forbidden = _forbidden_unless_assigned(principal, principal["school_id"], classroom_id, subject_id)
+    if forbidden:
+        return forbidden
+    try:
+        lesson = db.open_lesson(
+            principal["school_id"], classroom_id, subject_id, teacher_member_id, lesson_date
+        )
+        return jsonify(lesson), 201
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/lessons/<int:lesson_id>", methods=["GET"])
+@require_roles("school_admin", "professor")
+def api_get_lesson(lesson_id: int, principal):
+    lesson = db.get_lesson(principal["school_id"], lesson_id)
+    if not lesson:
+        return jsonify({"error": "Aula não encontrada"}), 404
+    forbidden = _forbidden_unless_lesson_owner(principal, lesson)
+    if forbidden:
+        return forbidden
+    return jsonify(lesson)
+
+
+@app.route("/api/lessons/<int:lesson_id>/attendance/<face_id>", methods=["PUT"])
+@require_roles("school_admin", "professor")
+def api_update_lesson_attendance(lesson_id: int, face_id: str, principal):
+    lesson = db.get_lesson(principal["school_id"], lesson_id)
+    if not lesson:
+        return jsonify({"error": "Aula não encontrada"}), 404
+    forbidden = _forbidden_unless_lesson_owner(principal, lesson)
+    if forbidden:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    try:
+        db.update_lesson_attendance(
+            principal["school_id"], lesson_id, face_id, payload.get("status", ""),
+            principal.get("member_id"),
+        )
+        return jsonify({"success": True})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/lessons/<int:lesson_id>/confirm", methods=["POST"])
+@require_roles("school_admin", "professor")
+def api_confirm_lesson(lesson_id: int, principal):
+    lesson = db.get_lesson(principal["school_id"], lesson_id)
+    if not lesson:
+        return jsonify({"error": "Aula não encontrada"}), 404
+    forbidden = _forbidden_unless_lesson_owner(principal, lesson)
+    if forbidden:
+        return forbidden
+    try:
+        db.confirm_lesson(principal["school_id"], lesson_id, principal.get("member_id"))
+        return jsonify({"success": True})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/lessons/<int:lesson_id>/content", methods=["PUT"])
+@require_roles("school_admin", "professor")
+def api_update_lesson_content(lesson_id: int, principal):
+    lesson = db.get_lesson(principal["school_id"], lesson_id)
+    if not lesson:
+        return jsonify({"error": "Aula não encontrada"}), 404
+    forbidden = _forbidden_unless_lesson_owner(principal, lesson)
+    if forbidden:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    try:
+        db.update_lesson_content(principal["school_id"], lesson_id, payload.get("content", ""))
+        return jsonify({"success": True})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/assessments", methods=["GET", "POST"])
+@require_roles("school_admin", "professor")
+def api_assessments(principal):
+    if request.method == "GET":
+        classroom_id = request.args.get("classroom_id", type=int)
+        subject_id = request.args.get("subject_id", type=int)
+        return jsonify({"items": db.list_assessments(principal["school_id"], classroom_id, subject_id)})
+    payload = request.get_json(silent=True) or {}
+    classroom_id = payload.get("classroom_id")
+    subject_id = payload.get("subject_id")
+    forbidden = _forbidden_unless_assigned(principal, principal["school_id"], classroom_id, subject_id)
+    if forbidden:
+        return forbidden
+    try:
+        assessment = db.create_assessment(
+            principal["school_id"], classroom_id, subject_id,
+            payload.get("title", ""), payload.get("assessment_date", ""),
+            payload.get("max_score", 10), principal.get("member_id"),
+        )
+        return jsonify(assessment), 201
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/assessments/<int:assessment_id>/grades", methods=["GET", "POST"])
+@require_roles("school_admin", "professor")
+def api_assessment_grades(assessment_id: int, principal):
+    if request.method == "GET":
+        try:
+            return jsonify({"items": db.list_grades(principal["school_id"], assessment_id)})
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 404
+    payload = request.get_json(silent=True) or {}
+    try:
+        db.upsert_grade(
+            principal["school_id"], assessment_id, payload.get("face_id", ""),
+            float(payload.get("score")), principal.get("member_id"),
+        )
+        return jsonify({"success": True}), 201
+    except (ValueError, TypeError) as exc:
         return jsonify({"error": str(exc)}), 400
 
 
@@ -660,6 +964,18 @@ def control_id_callback():
         event_id, direction, duplicate = db.record_device_presence(
             device["school_id"], device_id, external_id, face_id, payload.get("event_at")
         )
+        if not duplicate:
+            person = db.get_face(face_id)
+            event = {
+                "id": event_id,
+                "face_id": face_id,
+                "direction": direction,
+                "event_at": payload.get("event_at") or _iso_now(),
+                "match_score": None,
+                "school_id": device["school_id"],
+                "device_id": device_id,
+            }
+            _publish_presence_webhook(event, person or {"id": face_id, "school_id": device["school_id"]})
         return jsonify({"access": "granted", "event_id": event_id, "direction": direction, "duplicate": duplicate})
     except ValueError as exc:
         return jsonify({"access": "denied", "error": str(exc)}), 403

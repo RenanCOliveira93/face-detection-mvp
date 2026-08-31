@@ -80,6 +80,94 @@ class SchoolIntegrityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.db.record_device_presence(self.a["id"], "gate-a", "event-b", "b1")
 
+    def test_camera_presence_event_enqueues_outbox_when_school_assigned(self) -> None:
+        self.db.create_presence_event("a1", "entrada", 0.5)
+        self.assertEqual(len(self.db.pending_outbox()), 1)
+
+    def test_erase_student_removes_orphan_guardian_but_keeps_shared_one(self) -> None:
+        self.db.add_face("a2", "Aluno A2", "", school_id=self.a["id"])
+        with self.db._connect() as conn:
+            now_iso = "2026-08-11T12:00:00+00:00"
+            cur = conn.execute(
+                "INSERT INTO guardians (full_name, created_at, active) VALUES (?, ?, 1)",
+                ("Mãe compartilhada", now_iso),
+            )
+            shared_guardian_id = int(cur.lastrowid)
+            conn.execute(
+                "INSERT INTO guardian_phones (guardian_id, phone_e164, is_primary, channel, active, created_at) "
+                "VALUES (?, ?, 1, 'whatsapp', 1, ?)",
+                (shared_guardian_id, "5511888888888", now_iso),
+            )
+            for face_id in ("a1", "a2"):
+                conn.execute(
+                    "INSERT INTO student_guardians (face_id, guardian_id, relationship_type, "
+                    "contact_priority, valid_from, valid_to, active, created_at) "
+                    "VALUES (?, ?, 'mãe', 0, ?, NULL, 1, ?)",
+                    (face_id, shared_guardian_id, now_iso, now_iso),
+                )
+            conn.commit()
+
+        event_id = self.db.create_presence_event("a1", "entrada", 0.9)
+        self.db.update_presence_event_message(event_id, True, "Aluno Aluno A chegou na escola.")
+        self.db.update_presence_event_webhook(event_id, True, 200, "resposta com dados do aluno")
+        self.db.log_detection("a1", similarity=0.9, message_ok=True, message_info="Aluno Aluno A chegou.")
+
+        self.db.erase_student_personal_data(self.a["id"], "a1")
+
+        with self.db._connect() as conn:
+            guardian_still_there = conn.execute(
+                "SELECT 1 FROM guardians WHERE id=?", (shared_guardian_id,)
+            ).fetchone()
+            still_linked_to_a2 = conn.execute(
+                "SELECT 1 FROM student_guardians WHERE face_id='a2' AND guardian_id=?", (shared_guardian_id,)
+            ).fetchone()
+            linked_to_a1 = conn.execute(
+                "SELECT 1 FROM student_guardians WHERE face_id='a1'"
+            ).fetchone()
+        self.assertIsNotNone(guardian_still_there, "guardian ainda vinculado a a2 não deve ser removido")
+        self.assertIsNotNone(still_linked_to_a2)
+        self.assertIsNone(linked_to_a1)
+
+        events = self.db.get_presence_events(school_id=self.a["id"])
+        self.assertEqual(events[0]["message_info"], "[dados removidos]")
+        self.assertEqual(events[0]["webhook_info"], "[dados removidos]")
+
+        with self.db._connect() as conn:
+            face = conn.execute("SELECT full_name, active FROM faces WHERE id='a1'").fetchone()
+        self.assertEqual(face["full_name"], "Titular removido")
+        self.assertEqual(face["active"], 0)
+
+    def test_erase_student_removes_guardian_left_without_other_links(self) -> None:
+        with self.db._connect() as conn:
+            now_iso = "2026-08-11T12:00:00+00:00"
+            cur = conn.execute(
+                "INSERT INTO guardians (full_name, created_at, active) VALUES (?, ?, 1)",
+                ("Mãe exclusiva", now_iso),
+            )
+            guardian_id = int(cur.lastrowid)
+            conn.execute(
+                "INSERT INTO guardian_phones (guardian_id, phone_e164, is_primary, channel, active, created_at) "
+                "VALUES (?, ?, 1, 'whatsapp', 1, ?)",
+                (guardian_id, "5511777777777", now_iso),
+            )
+            conn.execute(
+                "INSERT INTO student_guardians (face_id, guardian_id, relationship_type, "
+                "contact_priority, valid_from, valid_to, active, created_at) "
+                "VALUES ('a1', ?, 'mãe', 0, ?, NULL, 1, ?)",
+                (guardian_id, now_iso, now_iso),
+            )
+            conn.commit()
+
+        self.db.erase_student_personal_data(self.a["id"], "a1")
+
+        with self.db._connect() as conn:
+            guardian_row = conn.execute("SELECT 1 FROM guardians WHERE id=?", (guardian_id,)).fetchone()
+            phone_row = conn.execute(
+                "SELECT 1 FROM guardian_phones WHERE guardian_id=?", (guardian_id,)
+            ).fetchone()
+        self.assertIsNone(guardian_row)
+        self.assertIsNone(phone_row)
+
 
 if __name__ == "__main__":
     unittest.main()
